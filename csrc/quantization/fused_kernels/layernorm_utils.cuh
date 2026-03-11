@@ -384,8 +384,7 @@ __device__ void compute_dynamic_per_token_scales(
       scale = max(scale / qmax, min_scaling_factor<scalar_out_t>::val());
       // Global output store
       if constexpr (is_scale_transposed) {
-        int64_t const scale_rows = (gridDim.x + outer_scale_stride - 1) /
-                                   outer_scale_stride * outer_scale_stride;
+        int64_t const scale_rows = gridDim.x; 
         all_token_scales[(threadIdx.x / threads_per_group) * scale_rows +
                          blockIdx.x] = scale;
       } else {
