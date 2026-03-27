@@ -3,7 +3,7 @@
 import argparse
 import copy
 import itertools
-
+import os
 import torch
 from weight_shapes import WEIGHT_SHAPES
 
@@ -155,13 +155,14 @@ if __name__ == "__main__":
         help="List of tensor parallel sizes",
     )
     args = parser.parse_args()
-
     for K, N, model in prepare_shapes(args):
+        save_path = f"bench_int8_res_n{N}_k{K}"
+        os.makedirs(save_path, exist_ok=True)
         print(f"{model}, N={N} K={K}, BF16 vs INT8 GEMMs TFLOP/s:")
         benchmark.run(
             print_data=True,
             show_plots=True,
-            save_path=f"bench_int8_res_n{N}_k{K}",
+            save_path=save_path,
             N=N,
             K=K,
         )

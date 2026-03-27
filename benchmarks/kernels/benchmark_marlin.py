@@ -16,13 +16,30 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     MARLIN_SUPPORTED_GROUP_SIZES,
     query_marlin_supported_quant_types,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    FP4_MARLIN_SUPPORTED_GROUP_SIZES,
-    rand_marlin_weight_fp4_like,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-    marlin_quant_fp8_torch,
-)
+
+# 兼容性导入 - 处理不同 vLLM 版本
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        FP4_MARLIN_SUPPORTED_GROUP_SIZES,
+        rand_marlin_weight_fp4_like,
+    )
+except ImportError:
+    try:
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            FP4_MARLIN_SUPPORTED_GROUP_SIZES,
+            rand_marlin_weight_mxfp4_like as rand_marlin_weight_fp4_like,
+        )
+    except ImportError:
+        FP4_MARLIN_SUPPORTED_GROUP_SIZES = []
+        rand_marlin_weight_fp4_like = None
+
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        marlin_quant_fp8_torch,
+    )
+except ImportError:
+    marlin_quant_fp8_torch = None
+
 from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
     MarlinWorkspace,
     awq_marlin_quantize,
@@ -81,12 +98,16 @@ def bench_run(
         # Marlin quant
         marlin_g_idx = marlin_sort_indices = marlin_zp = marlin_s2 = None
         if quant_type == scalar_types.float4_e2m1f:
+            if rand_marlin_weight_fp4_like is None:
+                return
             if group_size != 16 or act_order:
                 return
             marlin_w_ref, marlin_q_w, marlin_s, marlin_s2 = rand_marlin_weight_fp4_like(
                 b.T, group_size
             )
         elif quant_type == scalar_types.float8_e4m3fn:
+            if marlin_quant_fp8_torch is None:
+                return
             if group_size not in [-1, 128] or act_order:
                 return
             marlin_w_ref, marlin_q_w, marlin_s = marlin_quant_fp8_torch(b.T, group_size)
@@ -164,6 +185,11 @@ def bench_run(
         marlin_g_idx,
         marlin_sort_indices,
     ) = gen_marlin_params()
+    
+    # 如果 FP4/FP8 不支持，跳过
+    if marlin_q_w is None:
+        return
+    
     q_w_gptq, repack_sort_indices = gen_repack_params()
     qw_reorder, s_reorder, zp_reorder, sm_count, sm_version, CUBLAS_M_THRESHOLD = (
         gen_allspark_params()
