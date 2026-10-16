@@ -1754,16 +1754,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
                 schedule_metadata[:] = metadata
 
+            # Keep the profitability gate on the host. The upper bound is
+            # exact outside async speculative decode and conservative there.
+            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+            max_decode_seq_len = int(
+                common_attn_metadata.seq_lens_cpu_upper_bound[:num_decodes]
+                .max()
+                .item()
+            )
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
-                max_seq_len=(
-                    int(seq_lens_cpu[:num_decodes].max().item())
-                    // self.compress_ratio
-                ),
+                max_seq_len=max_decode_seq_len // self.compress_ratio,
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
