@@ -788,14 +788,18 @@ def test_candidate_gather_profitability_gate(monkeypatch: pytest.MonkeyPatch):
         candidate_gather_decode_profitable,
     )
 
-    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_CONTEXT_RATIO", "4")
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO", "64")
     monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS", "16")
     candidate_width = 32 * 16
-    assert not candidate_gather_decode_profitable(4 * candidate_width, 15, 32, 16)
+    # The row floor applies before any work accounting.
+    assert not candidate_gather_decode_profitable(64 * candidate_width, 15, 32, 16)
+    # Work is rows x context, so a long context alone is not sufficient and a
+    # shorter context becomes profitable once enough rows scan it.
     assert not candidate_gather_decode_profitable(
         4 * candidate_width - 1, 16, 32, 16
     )
     assert candidate_gather_decode_profitable(4 * candidate_width, 16, 32, 16)
+    assert candidate_gather_decode_profitable(2 * candidate_width, 32, 32, 16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

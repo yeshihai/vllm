@@ -897,7 +897,8 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        use_cand_gather = (
+        use_cand_gather = False
+        if (
             candidate_blocks is not None
             and not candidate_write
             and candidate_gather_decode_available(
@@ -909,13 +910,31 @@ def sparse_attn_indexer(
                 topk_tokens=topk_tokens,
                 topk_backend=topk_backend,
             )
-            and candidate_gather_decode_profitable(
+        ):
+            use_cand_gather = candidate_gather_decode_profitable(
                 decode_metadata.max_seq_len,
                 num_padded_tokens,
                 candidate_blocks.shape[1],
                 candidate_block_size,
             )
-        )
+            if not use_cand_gather:
+                # The gates are deployment-tunable, so report the observed
+                # shape once instead of silently keeping the dense path.
+                logger.info_once(
+                    "SM90 candidate-gather decode scoring supported but gated "
+                    "off: decode rows=%d (need >= %d), compressed decode "
+                    "context=%d, scanned work rows x context=%d (need >= %d = "
+                    "%d x candidate width %d).",
+                    num_padded_tokens,
+                    envs.VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS,
+                    decode_metadata.max_seq_len,
+                    num_padded_tokens * decode_metadata.max_seq_len,
+                    envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO
+                    * candidate_blocks.shape[1]
+                    * candidate_block_size,
+                    envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO,
+                    candidate_blocks.shape[1] * candidate_block_size,
+                )
         if use_cand_gather:
             logger.info_once(
                 "SM90 candidate-gather decode scoring active: consumer "

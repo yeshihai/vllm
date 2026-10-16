@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_DSA_CANDIDATE_GATHER_DECODE: bool = False
-    VLLM_DSA_CANDIDATE_GATHER_MIN_CONTEXT_RATIO: int = 1
+    VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO: int = 1
     VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS: int = 1
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
@@ -1095,8 +1095,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Optional workload gates for candidate gather. Their profitable values
     # are hardware-dependent; defaults impose only shape-level lower bounds.
-    "VLLM_DSA_CANDIDATE_GATHER_MIN_CONTEXT_RATIO": lambda: int(
-        os.getenv("VLLM_DSA_CANDIDATE_GATHER_MIN_CONTEXT_RATIO", "1")
+    # Dense scoring costs scale with rows x context while candidate scoring is
+    # dominated by a per-step fixed cost, so the crossover tracks the product
+    # ``rows * context / candidate_width`` rather than context alone.
+    "VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO": lambda: int(
+        os.getenv("VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO", "1")
     ),
     # Decode rows include speculative rows.
     "VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS": lambda: int(

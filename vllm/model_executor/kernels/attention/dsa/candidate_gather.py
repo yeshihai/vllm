@@ -360,15 +360,21 @@ def candidate_gather_decode_profitable(
 ) -> bool:
     """Apply user-tunable host-side shape gates before candidate scoring.
 
-    Crossover points are hardware-dependent, so this function intentionally
-    contains no device-specific performance constants.
+    Dense scoring reads the whole context for every decode row, while
+    candidate scoring reads a fixed candidate width per row and is dominated
+    by a per-step fixed cost. The crossover therefore tracks the scanned work
+    ``num_rows * max_seq_len`` relative to the candidate width, not the
+    context length alone. The crossover constant is hardware-dependent, so no
+    device-specific value is baked in here.
     """
     import vllm.envs as envs
 
     candidate_width = num_candidates * candidate_block_size
-    min_ratio = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_CONTEXT_RATIO)
+    min_ratio = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO)
     min_rows = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS)
-    return num_rows >= min_rows and max_seq_len >= min_ratio * candidate_width
+    if num_rows < min_rows:
+        return False
+    return num_rows * max_seq_len >= min_ratio * candidate_width
 
 
 def candidate_gather_decode_available(
