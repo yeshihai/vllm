@@ -18,6 +18,8 @@ problem without requantizing K. Different scoring kernels and top-k tie
 breaking can still change floating-point results or the selected indices.
 """
 
+import functools
+
 import torch
 
 from vllm.logger import init_logger
@@ -35,6 +37,57 @@ from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+# Per-position bytes the indexer FP8 cache adds on top of the head_dim fp8
+# payload: one fp32 scale.
+_INDEXER_SCALE_BYTES = 4
+
+# Times the candidate path moves each candidate position: read it from the
+# paged cache, write it to the gather workspace, read the workspace back to
+# score it. Dense scoring reads each context position once.
+_GATHER_PASSES = 3
+
+# Fraction of peak memory bandwidth these streaming kernels actually reach.
+# Only scales the measured fixed cost into bytes, so it needs no precision.
+_ACHIEVABLE_BANDWIDTH_FRACTION = 0.8
+
+# Used when the device does not report clock/bus width, so the gate stays
+# usable rather than silently disabling the path. Roughly an SM90 HBM part.
+_FALLBACK_BANDWIDTH_BYTES_PER_US = 3.0e6
+
+
+@functools.lru_cache(maxsize=None)
+def _bandwidth_bytes_per_us_for_index(device_index: int) -> float:
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        clock_hz = props.memory_clock_rate * 1.0e3
+        bus_bytes = props.memory_bus_width / 8
+        # DDR: two transfers per clock.
+        peak_bytes_per_second = 2 * clock_hz * bus_bytes
+        bytes_per_us = peak_bytes_per_second * _ACHIEVABLE_BANDWIDTH_FRACTION / 1.0e6
+    except (AssertionError, AttributeError, RuntimeError):
+        bytes_per_us = 0.0
+    if bytes_per_us <= 0:
+        logger.warning_once(
+            "Could not derive memory bandwidth for the candidate-gather "
+            "profitability model; assuming %.0f GB/s.",
+            _FALLBACK_BANDWIDTH_BYTES_PER_US * 1e6 / 1e9,
+        )
+        return _FALLBACK_BANDWIDTH_BYTES_PER_US
+    return bytes_per_us
+
+
+def _device_bandwidth_bytes_per_us() -> float:
+    """Achievable memory bandwidth of the current device, in bytes per us.
+
+    Derived from the reported memory clock and bus width so the profitability
+    crossover scales with the device instead of being tuned per GPU.
+    """
+    try:
+        device_index = torch.cuda.current_device()
+    except RuntimeError:
+        return _FALLBACK_BANDWIDTH_BYTES_PER_US
+    return _bandwidth_bytes_per_us_for_index(device_index)
 
 
 @triton.jit(
@@ -359,27 +412,45 @@ def candidate_gather_decode_profitable(
     num_rows: int,
     num_candidates: int,
     candidate_block_size: int,
+    head_dim: int,
 ) -> bool:
-    """Apply user-tunable host-side shape gates before candidate scoring.
+    """Whether candidate-only scoring should beat dense scoring for this step.
 
-    Dense scoring reads the whole context for every decode row, while
-    candidate scoring reads a fixed candidate width per row and is dominated
-    by a per-step fixed cost. The crossover therefore tracks the scanned work
-    ``num_rows * max_seq_len`` relative to the candidate width, not the
-    context length alone. The crossover constant is hardware-dependent, so no
-    device-specific value is baked in here.
+    Both paths are bandwidth-bound streams over the FP8 indexer cache, so the
+    comparison is made in bytes moved and converted to time with the device's
+    own peak memory bandwidth. Dense scoring reads every context position once
+    per decode row. Candidate scoring instead touches each candidate position
+    ``_GATHER_PASSES`` times (read the paged cache, write the gather
+    workspace, read it back to score) and adds a per-step cost that does not
+    scale with rows, because at low row counts the kernel chain is launch- and
+    occupancy-bound rather than bandwidth-bound.
+
+    Only that fixed cost has to be measured; the row and context dependence
+    follows from the shapes, so the crossover moves with the device's
+    bandwidth instead of being a per-GPU row threshold. Being a performance
+    heuristic, a stale or wrong answer here only ever costs speed: both paths
+    compute the same top-k selection. Inputs may therefore be upper bounds,
+    which matters for CUDA graphs, where the decision is taken once at capture
+    using the deployment's longest context and then replayed unchanged.
     """
     import vllm.envs as envs
 
     if envs.VLLM_DSA_CANDIDATE_GATHER_FORCE:
         return True
+    if num_rows < max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS):
+        return False
 
     candidate_width = num_candidates * candidate_block_size
-    min_ratio = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO)
-    min_rows = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS)
-    if num_rows < min_rows:
+    # Necessary condition, independent of the device: the gather path must
+    # stream strictly fewer bytes per row than dense scoring.
+    if max_seq_len <= _GATHER_PASSES * candidate_width:
         return False
-    return num_rows * max_seq_len >= min_ratio * candidate_width
+
+    bytes_per_position = head_dim + _INDEXER_SCALE_BYTES
+    positions_saved = max_seq_len - _GATHER_PASSES * candidate_width
+    saved_bytes = num_rows * bytes_per_position * positions_saved
+    fixed_cost_us = envs.VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US
+    return saved_bytes >= fixed_cost_us * _device_bandwidth_bytes_per_us()
 
 
 def candidate_gather_decode_available(

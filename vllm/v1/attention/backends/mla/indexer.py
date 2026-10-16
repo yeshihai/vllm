@@ -725,7 +725,11 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
-    # Host-side maximum decode context in indexer-cache (compressed) positions.
+    # Host-side maximum decode context in indexer-cache (compressed)
+    # positions. Equals max_model_len (compressed) while building metadata
+    # for a CUDA graph capture, so path choices baked into a graph stay
+    # valid for every replay; the batch's own bound otherwise. May be an
+    # upper bound, so it must only drive performance decisions.
     max_seq_len: int = 0
     global_seq_lens: torch.Tensor | None = None
     per_req_decode_lens: torch.Tensor | None = None
@@ -1754,21 +1758,24 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
                 schedule_metadata[:] = metadata
 
-            # Keep the profitability gate on the host. The upper bound is
-            # exact outside async speculative decode and conservative there.
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            max_decode_seq_len = int(
-                common_attn_metadata.seq_lens_cpu_upper_bound[:num_decodes]
-                .max()
-                .item()
-            )
+            # Host-side bound for the candidate-gather profitability gate.
+            # common_attn_metadata.max_seq_len is deliberately
+            # capture-aware: the runner substitutes max_model_len while
+            # building metadata for a CUDA graph capture, so a graph bakes
+            # the choice that the deployment's longest context warrants
+            # rather than the warmup batch's short context. Replays of that
+            # graph then keep a fixed, correct path regardless of the live
+            # context length. Outside capture this is the batch's own bound,
+            # so eager steps pick per-step. It may be an upper bound (async
+            # spec decode, or a longer prefill row sharing the batch), which
+            # only ever costs a suboptimal path choice, never correctness.
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
-                max_seq_len=max_decode_seq_len // self.compress_ratio,
+                max_seq_len=common_attn_metadata.max_seq_len // self.compress_ratio,
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],

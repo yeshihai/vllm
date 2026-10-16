@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_DSA_CANDIDATE_GATHER_DECODE: bool = False
     VLLM_DSA_CANDIDATE_GATHER_FORCE: bool = False
-    VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO: int = 1
+    VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US: float = 1000.0
     VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS: int = 1
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
@@ -1100,15 +1100,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSA_CANDIDATE_GATHER_FORCE": lambda: bool(
         int(os.getenv("VLLM_DSA_CANDIDATE_GATHER_FORCE", "0"))
     ),
-    # Optional workload gates for candidate gather. Their profitable values
-    # are hardware-dependent; defaults impose only shape-level lower bounds.
-    # Dense scoring costs scale with rows x context while candidate scoring is
-    # dominated by a per-step fixed cost, so the crossover tracks the product
-    # ``rows * context / candidate_width`` rather than context alone.
-    "VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO": lambda: int(
-        os.getenv("VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO", "1")
+    # Measured fixed per-step cost of the candidate-gather kernel chain, in
+    # microseconds. This is the one quantity in the profitability model that
+    # has to be measured; everything else is derived from shapes and the
+    # device's own memory bandwidth, so the crossover adapts across devices
+    # instead of encoding a per-GPU row threshold. Measure it with
+    # benchmarks/kernels/benchmark_dsa_candidate_gather.py. The default
+    # deliberately overestimates, which only ever withholds the optimization
+    # from batches where it would have helped; it never regresses them.
+    "VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US": lambda: float(
+        os.getenv("VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US", "1000")
     ),
-    # Decode rows include speculative rows.
+    # Optional hard floor on decode rows (speculative rows included), applied
+    # on top of the model above. 1 disables it.
     "VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS": lambda: int(
         os.getenv("VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS", "1")
     ),

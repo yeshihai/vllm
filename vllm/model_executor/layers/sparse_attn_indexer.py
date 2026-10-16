@@ -916,24 +916,23 @@ def sparse_attn_indexer(
                 num_padded_tokens,
                 candidate_blocks.shape[1],
                 candidate_block_size,
+                head_dim,
             )
             if not use_cand_gather:
-                # The gates are deployment-tunable, so report the observed
-                # shape once instead of silently keeping the dense path.
+                # Report the observed shape once: the fixed-cost term is the
+                # one value an operator may need to re-measure per device.
                 logger.info_once(
-                    "SM90 candidate-gather decode scoring supported but gated "
-                    "off: decode rows=%d (need >= %d), compressed decode "
-                    "context=%d, scanned work rows x context=%d (need >= %d = "
-                    "%d x candidate width %d).",
+                    "SM90 candidate-gather decode scoring supported but not "
+                    "selected: decode rows=%d (hard floor %d), compressed "
+                    "decode context=%d, candidate width=%d, assumed fixed "
+                    "cost=%.0f us. Re-measure the fixed cost for this device "
+                    "with benchmarks/kernels/benchmark_dsa_candidate_gather.py "
+                    "if the dense path is in fact slower here.",
                     num_padded_tokens,
                     envs.VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS,
                     decode_metadata.max_seq_len,
-                    num_padded_tokens * decode_metadata.max_seq_len,
-                    envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO
-                    * candidate_blocks.shape[1]
-                    * candidate_block_size,
-                    envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO,
                     candidate_blocks.shape[1] * candidate_block_size,
+                    envs.VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US,
                 )
         if use_cand_gather:
             logger.info_once(

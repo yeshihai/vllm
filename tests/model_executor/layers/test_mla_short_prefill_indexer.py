@@ -782,21 +782,83 @@ def test_candidate_gather_supports_packed_cache_and_tail_tile():
 
 
 def test_candidate_gather_profitability_gate(monkeypatch: pytest.MonkeyPatch):
+    from vllm.model_executor.kernels.attention.dsa import candidate_gather
     from vllm.model_executor.kernels.attention.dsa.candidate_gather import (
-        candidate_gather_decode_profitable,
+        candidate_gather_decode_profitable as profitable,
     )
 
     monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_FORCE", "0")
-    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO", "64")
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS", "1")
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US", "1000")
+    # Pin the bandwidth so the crossover is exercised without a device.
+    bandwidth = 1.0e6
+    monkeypatch.setattr(
+        candidate_gather, "_device_bandwidth_bytes_per_us", lambda *_: bandwidth
+    )
+
+    num_candidates, block, head_dim = 32, 16, 128
+    candidate_width = num_candidates * block
+    bytes_per_position = head_dim + candidate_gather._INDEXER_SCALE_BYTES
+    break_even = candidate_gather._GATHER_PASSES * candidate_width
+
+    # Necessary condition: below the break-even context the gather path
+    # streams more bytes per row than dense, so no row count can pay it off.
+    assert not profitable(break_even, 1 << 20, num_candidates, block, head_dim)
+
+    # Above it, the saved bytes must cover the measured fixed cost. Rows and
+    # context enter only through their product, so the crossover is a curve.
+    context = 1 << 20
+    saved_per_row = bytes_per_position * (context - break_even)
+    fixed_cost_bytes = 1000 * bandwidth
+    crossover_rows = -(-fixed_cost_bytes // saved_per_row)  # ceil
+    assert profitable(context, crossover_rows, num_candidates, block, head_dim)
+    assert not profitable(context, crossover_rows - 1, num_candidates, block, head_dim)
+
+    # Halving the context must roughly double the rows needed.
+    half = break_even + (context - break_even) // 2
+    assert not profitable(half, crossover_rows, num_candidates, block, head_dim)
+    assert profitable(half, 2 * crossover_rows, num_candidates, block, head_dim)
+
+    # The optional hard floor is applied before the model.
     monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS", "16")
-    candidate_width = 32 * 16
-    # The row floor applies before any work accounting.
-    assert not candidate_gather_decode_profitable(64 * candidate_width, 15, 32, 16)
-    # Work is rows x context, so a long context alone is not sufficient and a
-    # shorter context becomes profitable once enough rows scan it.
-    assert not candidate_gather_decode_profitable(4 * candidate_width - 1, 16, 32, 16)
-    assert candidate_gather_decode_profitable(4 * candidate_width, 16, 32, 16)
-    assert candidate_gather_decode_profitable(2 * candidate_width, 32, 32, 16)
+    assert not profitable(context, 15, num_candidates, block, head_dim)
+    assert profitable(context, 16, num_candidates, block, head_dim)
+
+    # FORCE is validation-only and bypasses both the floor and the model.
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_FORCE", "1")
+    assert profitable(1, 1, num_candidates, block, head_dim)
+
+
+def test_candidate_gather_gate_is_monotonic(monkeypatch: pytest.MonkeyPatch):
+    """A CUDA graph bakes one decision for a fixed row count, taken with the
+    deployment's longest context. Monotonicity in both arguments is what makes
+    that safe to reason about: a graph chosen for the longest context is the
+    most favourable case, and replays at shorter contexts only lose speed."""
+    from vllm.model_executor.kernels.attention.dsa import candidate_gather
+    from vllm.model_executor.kernels.attention.dsa.candidate_gather import (
+        candidate_gather_decode_profitable as profitable,
+    )
+
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_FORCE", "0")
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS", "1")
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_FIXED_COST_US", "1000")
+    monkeypatch.setattr(
+        candidate_gather, "_device_bandwidth_bytes_per_us", lambda *_: 1.0e6
+    )
+    num_candidates, block, head_dim = 32, 16, 128
+
+    for rows in (1, 4, 16, 64):
+        flips = [
+            profitable(context, rows, num_candidates, block, head_dim)
+            for context in range(1 << 10, 1 << 21, 1 << 15)
+        ]
+        assert flips == sorted(flips), "not monotonic in context"
+    for context in (1 << 14, 1 << 17, 1 << 20):
+        flips = [
+            profitable(context, rows, num_candidates, block, head_dim)
+            for rows in range(1, 256, 8)
+        ]
+        assert flips == sorted(flips), "not monotonic in rows"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

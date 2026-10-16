@@ -26,12 +26,11 @@ class CandidateGatherForceTest(unittest.TestCase):
                 "VLLM_DSA_CANDIDATE_GATHER_FORCE": "0",
                 "VLLM_DSA_CANDIDATE_GATHER_DECODE": "0",
                 "VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS": "16",
-                "VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO": "1500",
             },
         ):
-            self.assertFalse(candidate_gather_decode_profitable(6, 6, 2048, 8))
+            self.assertFalse(candidate_gather_decode_profitable(6, 6, 2048, 8, 128))
             os.environ["VLLM_DSA_CANDIDATE_GATHER_FORCE"] = "1"
-            self.assertTrue(candidate_gather_decode_profitable(6, 6, 2048, 8))
+            self.assertTrue(candidate_gather_decode_profitable(6, 6, 2048, 8, 128))
             self.assertFalse(
                 candidate_gather_decode_available(False, 1, False, 8, 2048, 512, "auto")
             )
@@ -89,7 +88,6 @@ class CandidateGatherGraphTest(unittest.TestCase):
                     "VLLM_DSA_CANDIDATE_GATHER_DECODE": "1",
                     "VLLM_DSA_CANDIDATE_GATHER_FORCE": "1",
                     "VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS": "16",
-                    "VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO": "1500",
                 },
             ),
             patch.object(workspace, "_manager", None),
@@ -135,7 +133,7 @@ class CandidateGatherGraphTest(unittest.TestCase):
             if not candidate_gather_decode_available(
                 False, 1, False, cbk, num_candidates, topk, backend
             ) or not candidate_gather_decode_profitable(
-                host_context, rows, num_candidates, cbk
+                host_context, rows, num_candidates, cbk, head_dim
             ):
                 raise AssertionError("force must select gather even for dummy context")
             candidate_gather_score_decode(
