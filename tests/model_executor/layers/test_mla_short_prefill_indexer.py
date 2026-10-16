@@ -717,9 +717,7 @@ def test_candidate_gather_supports_packed_cache_and_tail_tile():
     num_blocks, block_size, head_dim = 8, 4, 128
     page_bytes = block_size * (head_dim + 4)
     block_stride = page_bytes + 64
-    backing = torch.zeros(
-        (num_blocks, block_stride), dtype=torch.uint8, device="cuda"
-    )
+    backing = torch.zeros((num_blocks, block_stride), dtype=torch.uint8, device="cuda")
     values = torch.randint(
         0,
         256,
@@ -788,6 +786,7 @@ def test_candidate_gather_profitability_gate(monkeypatch: pytest.MonkeyPatch):
         candidate_gather_decode_profitable,
     )
 
+    monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_FORCE", "0")
     monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO", "64")
     monkeypatch.setenv("VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS", "16")
     candidate_width = 32 * 16
@@ -795,9 +794,7 @@ def test_candidate_gather_profitability_gate(monkeypatch: pytest.MonkeyPatch):
     assert not candidate_gather_decode_profitable(64 * candidate_width, 15, 32, 16)
     # Work is rows x context, so a long context alone is not sufficient and a
     # shorter context becomes profitable once enough rows scan it.
-    assert not candidate_gather_decode_profitable(
-        4 * candidate_width - 1, 16, 32, 16
-    )
+    assert not candidate_gather_decode_profitable(4 * candidate_width - 1, 16, 32, 16)
     assert candidate_gather_decode_profitable(4 * candidate_width, 16, 32, 16)
     assert candidate_gather_decode_profitable(2 * candidate_width, 32, 32, 16)
 

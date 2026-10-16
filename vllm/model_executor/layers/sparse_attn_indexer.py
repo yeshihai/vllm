@@ -26,14 +26,14 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
 )
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    select_candidate_blocks as _select_candidate_blocks,
+)
 from vllm.model_executor.kernels.attention.dsa.candidate_gather import (
     candidate_gather_decode_available,
     candidate_gather_decode_profitable,
     candidate_gather_score_decode,
     candidate_gather_workspace_specs,
-)
-from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
-    select_candidate_blocks as _select_candidate_blocks,
 )
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,

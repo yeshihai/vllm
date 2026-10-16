@@ -13,8 +13,9 @@ This module provides the SM90 substitute for decode: gather each row's
 candidate K from the paged FP8 indexer cache into a contiguous workspace,
 score it with the existing dense (non-paged) MQA-logits kernel, run the
 usual decode top-k, and remap the selected columns back to request-local
-compressed positions. The gathered candidate set and the query are identical
-to the dense-then-mask path, so the resulting top-k indices are unchanged.
+compressed positions. For unique valid candidates this preserves the scoring
+problem without requantizing K. Different scoring kernels and top-k tie
+breaking can still change floating-point results or the selected indices.
 """
 
 import torch
@@ -257,6 +258,7 @@ def candidate_gather_score_decode(
         head_dim: Indexer head dim.
         max_seq_len: Host-side maximum context length for this batch.
         fp8_dtype: The platform FP8 dtype for the K workspace.
+
     """
     rows = q.shape[0]
     num_candidates = candidate_blocks.shape[1]
@@ -369,6 +371,9 @@ def candidate_gather_decode_profitable(
     """
     import vllm.envs as envs
 
+    if envs.VLLM_DSA_CANDIDATE_GATHER_FORCE:
+        return True
+
     candidate_width = num_candidates * candidate_block_size
     min_ratio = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO)
     min_rows = max(1, envs.VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS)
@@ -399,8 +404,7 @@ def candidate_gather_decode_available(
     if not envs.VLLM_DSA_CANDIDATE_GATHER_DECODE:
         return False
     if not (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability_family(90)
+        current_platform.is_cuda() and current_platform.is_device_capability_family(90)
     ):
         return False
     if use_fp4_cache or dcp_world_size != 1 or use_pcp:
@@ -419,6 +423,4 @@ def candidate_gather_decode_available(
     except ValueError:
         return False
     ratio = candidate_block_size // sparse_block_kv
-    if ratio not in (1, 2) or ratio * sparse_block_kv != candidate_block_size:
-        return False
-    return True
+    return ratio in (1, 2) and ratio * sparse_block_kv == candidate_block_size

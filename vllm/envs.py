@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_DSA_CANDIDATE_GATHER_DECODE: bool = False
+    VLLM_DSA_CANDIDATE_GATHER_FORCE: bool = False
     VLLM_DSA_CANDIDATE_GATHER_MIN_WORK_RATIO: int = 1
     VLLM_DSA_CANDIDATE_GATHER_MIN_ROWS: int = 1
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1088,10 +1089,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
-    # Experimental SM90 candidate-only decode scoring. Opt in after validating
-    # the workload; unsupported shapes and short contexts fall back to dense.
+    # Experimental SM90 candidate-only decode scoring. Unsupported shapes
+    # fall back to dense; without FORCE, workload gates also apply.
     "VLLM_DSA_CANDIDATE_GATHER_DECODE": lambda: bool(
         int(os.getenv("VLLM_DSA_CANDIDATE_GATHER_DECODE", "0"))
+    ),
+    # Validation only: bypass workload gates, including during FULL graph
+    # capture. Requires DECODE=1; platform/format checks still apply. Small
+    # batches and short contexts may regress. Set before starting workers.
+    "VLLM_DSA_CANDIDATE_GATHER_FORCE": lambda: bool(
+        int(os.getenv("VLLM_DSA_CANDIDATE_GATHER_FORCE", "0"))
     ),
     # Optional workload gates for candidate gather. Their profitable values
     # are hardware-dependent; defaults impose only shape-level lower bounds.
