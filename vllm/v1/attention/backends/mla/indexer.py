@@ -725,6 +725,8 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    # Host-side maximum decode context in indexer-cache (compressed) positions.
+    max_seq_len: int = 0
     global_seq_lens: torch.Tensor | None = None
     per_req_decode_lens: torch.Tensor | None = None
     decode_is_uniform: bool = True
@@ -1758,6 +1760,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
+                max_seq_len=(
+                    int(seq_lens_cpu[:num_decodes].max().item())
+                    // self.compress_ratio
+                ),
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
