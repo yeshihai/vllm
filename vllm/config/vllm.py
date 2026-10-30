@@ -30,7 +30,7 @@ from vllm.utils.hashing import safe_hash
 
 from .attention import AttentionConfig, HiSparseConfig
 from .aux_output import AuxOutputConfig
-from .cache import CacheConfig
+from .cache import CacheConfig, _layout_from_name
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .diffusion import DiffusionConfig
@@ -1542,7 +1542,9 @@ class VllmConfig:
             self.cache_config.kv_cache_layout is None
             and (requested_layout := envs.VLLM_KV_CACHE_LAYOUT) is not None
         ):
-            self.cache_config.kv_cache_layout = requested_layout
+            self.cache_config.kv_cache_layout = _layout_from_name(
+                requested_layout
+            ).name
 
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
             # Such an instance publishes encoder embeddings and runs no language
