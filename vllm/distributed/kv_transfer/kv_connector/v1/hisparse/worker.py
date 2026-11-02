@@ -353,6 +353,7 @@ class HiSparseConnectorWorker:
         self._metrics_calls = 0
         self._metrics_event = torch.Event()
         self._metrics_pending = False
+        self._active_request_ids: set[str] = set()
         self._init_dma()
         if self.is_host_writer:
             for layer_index, handle in enumerate(cache_handles):
@@ -364,6 +365,11 @@ class HiSparseConnectorWorker:
         self._initialized = True
 
     def set_request_state_indices(self, indices: torch.Tensor) -> None:
+        # The runtime may rebind its request-state tensor between the
+        # profiling and the real KV cache, so never keep a stale alias.
+        runtime_state = self.cache_handles[0].runtime.request_state_indices
+        if runtime_state is not None and runtime_state is not self.request_state_indices:
+            self.request_state_indices = runtime_state
         if indices.numel() > self.request_state_indices.numel():
             raise ValueError(
                 "HiSparse request-state mapping exceeds max_num_seqs: "
@@ -376,8 +382,38 @@ class HiSparseConnectorWorker:
         self.request_state_indices.fill_(-1)
         self.request_state_indices[: indices.numel()].copy_(indices)
         if self._pending_invalid_block_ids:
-            self.invalidate_blocks(self._pending_invalid_block_ids, indices)
+            self.invalidate_blocks(
+                self._pending_invalid_block_ids,
+                self.request_state_indices[: indices.numel()],
+            )
             self._pending_invalid_block_ids.clear()
+
+    def _reset_new_request_hot_rows(
+        self,
+        request_ids: list[str] | None,
+        request_state_indices: torch.Tensor,
+    ) -> None:
+        """Reused state rows must not serve the previous request's hot rows."""
+        if not request_ids:
+            return
+        new_positions = [
+            position
+            for position, request_id in enumerate(request_ids)
+            if request_id not in self._active_request_ids
+        ]
+        self._active_request_ids = set(request_ids)
+        if not new_positions:
+            return
+        positions = torch.tensor(
+            new_positions, dtype=torch.long, device=request_state_indices.device
+        )
+        runtime_state = self.cache_handles[0].runtime.request_state_indices
+        state_rows = runtime_state.index_select(0, positions).long()
+        state_rows = state_rows[state_rows >= 0]
+        if self.residency is not None:
+            self.residency[:, state_rows, :] = 0
+        for runtime in self.leader_runtimes:
+            runtime.reset_hot_rows(state_rows)
 
     def _init_dma(self) -> None:
         host_caches = tuple(cache.runtime.host_cache for cache in self.cache_handles)
@@ -396,10 +432,17 @@ class HiSparseConnectorWorker:
                 or resident_cache.stride(1) * resident_cache.element_size() != row_bytes
             ):
                 raise RuntimeError("HiSparse DMA requires contiguous resident rows.")
-            if (
-                host_cache.ndim != 2
-                or not host_cache.is_contiguous()
-                or host_cache.shape[1] * host_cache.element_size() != row_bytes
+            host_rows_ok = host_cache.ndim == 2 and host_cache.is_contiguous()
+            if host_cache.ndim == 3:
+                # Split-page host caches keep scales in a block-wide tail;
+                # whole-page copies stay valid in this paged layout.
+                host_rows_ok = (
+                    host_cache.stride(-1) == 1
+                    and host_cache.stride(1) * host_cache.element_size()
+                    == row_bytes
+                )
+            if not host_rows_ok or (
+                host_cache.shape[-1] * host_cache.element_size() != row_bytes
             ):
                 raise RuntimeError("HiSparse DMA requires contiguous host rows.")
 
@@ -449,6 +492,7 @@ class HiSparseConnectorWorker:
         self._pending_invalid_block_ids.extend(metadata.source_block_ids)
         if request_state_indices is not None:
             self.set_request_state_indices(request_state_indices)
+            self._reset_new_request_hot_rows(request_ids, request_state_indices)
         if metadata.residency_updates:
             assert self.residency is not None
             assert request_state_indices is not None and request_ids is not None
@@ -456,7 +500,7 @@ class HiSparseConnectorWorker:
                 self.residency,
                 metadata.residency_updates,
                 request_ids,
-                request_state_indices,
+                self.request_state_indices,
             )
 
     def _clear_forward_mirror_state(self) -> None:
