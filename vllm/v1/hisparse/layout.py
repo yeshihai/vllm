@@ -156,6 +156,13 @@ def _lay_out_hisparse_groups(
     vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]
 ) -> list[KVCacheGroupSpec]:
     source_specs, indexer_specs, remaining_specs = _partition_hisparse_specs(groups)
+    if vllm_config.cache_config.enable_prefix_caching and any(
+        spec.model_version == "deepseek_v41" for spec in source_specs.values()
+    ):
+        raise ValueError(
+            "HiSparse DeepSeek V4.1 host-backed compressed caches do not "
+            "support prefix caching yet; pass --no-enable-prefix-caching."
+        )
     block_sizes = {
         spec.block_size for spec in (*source_specs.values(), *indexer_specs.values())
     }

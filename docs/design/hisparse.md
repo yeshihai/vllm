@@ -2,6 +2,14 @@
 
 Status: experimental
 
+## DeepSeek V4.1 prefix-caching limitation
+
+The DeepSeek V4.1 host-backed compressed caches (the C1 and C2 source layers)
+do not support prefix caching yet: a prefix-cache hit can reuse source rows
+with stale residency state and corrupt the output. Enable HiSparse V4.1 with
+`--no-enable-prefix-caching` until the prefix-hit residency path is fixed; the
+layout rejects the combination at startup.
+
 ## The short version
 
 There are three different jobs:
