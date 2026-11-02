@@ -317,6 +317,7 @@ class DeepseekCompressor(nn.Module):
         self.device = current_platform.device_type
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.block_size = vllm_config.cache_config.block_size
 
         wkv_wgate_sizes = (
             [self.head_dim, self.head_dim] if self.has_gate else [self.head_dim]
@@ -455,12 +456,32 @@ class DeepseekCompressor(nn.Module):
                 num_tokens = min(
                     k_cache_metadata.slot_mapping.numel(), resident_slots.numel()
                 )
+                slots = resident_slots[:num_tokens].to(torch.int64)
+                if self.compress_ratio > 1:
+                    # Resident slots are per-token rows of the logical block;
+                    # the compressed cache stores ratio tokens per state.
+                    logical = (
+                        hisparse_cache.runtime.logical_block_size
+                        or self.block_size
+                    )
+                    storage = resident.block_size
+                    boundary = (
+                        positions[:num_tokens] + 1
+                    ) % self.compress_ratio == 0
+                    compressed = slots // logical * storage + (
+                        slots % logical
+                    ) // self.compress_ratio
+                    slots = torch.where(
+                        (slots >= 0) & boundary,
+                        compressed,
+                        torch.full_like(compressed, -1),
+                    )
                 rope_quant_insert(
                     latent,
                     positions,
                     rotary_emb.cos_sin_cache,
                     resident.cache,
-                    resident_slots[:num_tokens],
+                    slots,
                     self.compress_ratio,
                     fp8_scale=fp8_scale,
                 )

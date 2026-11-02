@@ -755,6 +755,9 @@ class HiSparseRuntime:
         self.row_width = row_width
         self.kv_dtype = kv_dtype
         self.storage_block_size = storage_block_size
+        # Logical token block size resolved by the KV cache layout; the bound
+        # group block size overrides it at binding time.
+        self.logical_block_size: int | None = None
         self.row_value_bytes = row_value_bytes
         self.device = torch.device(device)
         # Logical slots per request. Physical rows come from its ephemeral HMA
@@ -813,8 +816,12 @@ class HiSparseRuntime:
         num_blocks: int,
         block_size: int,
         block_table: torch.Tensor,
+        storage_block_size: int | None = None,
     ) -> None:
         """Bind this runtime's strided view into the shared GPU HMA slab."""
+        if storage_block_size is not None:
+            self.storage_block_size = storage_block_size
+        self.logical_block_size = block_size
         self.hot = PagedCacheView.bind(
             raw_tensor,
             dtype=self.kv_dtype,
@@ -1163,7 +1170,13 @@ class HiSparseRuntime:
         shared_rows = self._step_rows(num_tokens)
         group = self.index_group
         hot = self.hot
-        assert hot.block_size == block_size
+        assert hot.block_size == block_size, (
+            "HiSparse hot block mismatch:",
+            hot.block_size,
+            block_size,
+            self.storage_block_size,
+            self.row_width,
+        )
         assert hot.attention_block_stride == group.leader.hot.attention_block_stride
 
         if self.is_group_leader:
@@ -1311,7 +1324,11 @@ class HiSparseCacheHandle:
         block_size: int,
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
+        storage_block_size: int | None = None,
     ) -> None:
+        if storage_block_size is not None:
+            self.runtime.storage_block_size = storage_block_size
+        self.runtime.logical_block_size = block_size
         self.view = PagedCacheView.bind(
             raw_tensor,
             dtype=self.runtime.kv_dtype,
