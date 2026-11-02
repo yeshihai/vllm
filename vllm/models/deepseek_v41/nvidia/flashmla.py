@@ -248,9 +248,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     os.environ.get("VLLM_HISPARSE_DEBUG")
                     and hisparse_cache.runtime.real_batch_seen
                     and self.layer_id == 20
-                    and not getattr(self, "_hisparse_debug_done", False)
+                    and getattr(self, "_hisparse_debug_steps", 0) < 3
                 ):
-                    self._hisparse_debug_done = True
+                    self._hisparse_debug_steps = (
+                        getattr(self, "_hisparse_debug_steps", 0) + 1
+                    )
                     expected, expected_lens = compute_global_topk_indices_and_lens(
                         self.topk_indices_buffer[:num_decode_tokens],
                         swa_metadata.token_to_req_indices,
@@ -395,6 +397,25 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             extra_topk_length=topk_lens,
             out=output.unsqueeze(1),
         )
+
+        if (
+            os.environ.get("VLLM_HISPARSE_DEBUG")
+            and not swa_only
+            and self.layer_id in (2, 20)
+            and int(torch.isnan(output).sum())
+        ):
+            hisparse_cache = self._hisparse_cache()
+            print(
+                "HISPARSE_NAN",
+                "layer", self.layer_id,
+                "decode_tokens", num_decode_tokens,
+                "lens", None if topk_lens is None else topk_lens[:4].tolist(),
+                "state",
+                None
+                if hisparse_cache is None
+                else hisparse_cache.runtime.request_state_indices[:8].tolist(),
+                flush=True,
+            )
 
     def _forward_prefill(
         self,
