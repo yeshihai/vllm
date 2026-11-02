@@ -212,20 +212,20 @@ def _lay_out_hisparse_groups(
     resident_groups: list[KVCacheGroupSpec] = []
     hot_groups: list[KVCacheGroupSpec] = []
 
+    # One block stride holds every hot/resident page. Mixing C1 (37,440 B) and
+    # C2 (19,008 B) pages makes that stride their LCM (~1.2 MB), which collapses
+    # the device pool. Pad every hot page to the largest source page instead;
+    # the unused padding is never addressed.
+    hot_page_size = max(spec.page_size_bytes for spec in source_specs.values())
+
     def append_hot_group(layers: list[tuple[str, MLAAttentionSpec]]) -> None:
-        page_sizes = {spec.page_size_bytes for _, spec in layers}
-        if len(page_sizes) != 1:
-            raise ValueError(
-                "HiSparse hot-cache groups require one page size, got "
-                f"{sorted(page_sizes)}."
-            )
         ratios = {spec.tokens_per_state for _, spec in layers}
         if len(ratios) != 1:
             raise ValueError(
                 "HiSparse hot-cache groups require one compression ratio, got "
                 f"{sorted(ratios)}."
             )
-        page_size = page_sizes.pop()
+        page_size = hot_page_size
         # The hot cache holds one row per compressed state, so a ratio-r
         # source packs r states per logical token block.
         storage_block_size = gpu_block_size // ratios.pop()
@@ -260,27 +260,26 @@ def _lay_out_hisparse_groups(
 
     current: list[tuple[str, MLAAttentionSpec]] = []
     current_page = 0
-    current_page_size: int | None = None
+    current_ratio: int | None = None
     for unit in hot_units:
-        unit_page = sum(spec.page_size_bytes for _, spec in unit)
-        unit_sizes = {spec.page_size_bytes for _, spec in unit}
-        if len(unit_sizes) != 1:
+        unit_ratios = {spec.tokens_per_state for _, spec in unit}
+        if len(unit_ratios) != 1:
             raise ValueError(
-                "HiSparse hot-cache units require one page size, got "
-                f"{sorted(unit_sizes)}."
+                "HiSparse hot-cache units require one compression ratio, got "
+                f"{sorted(unit_ratios)}."
             )
-        unit_size = unit_sizes.pop()
+        unit_ratio = int(unit_ratios.pop())
+        unit_page = hot_page_size * len(unit)
         if current and (
-            current_page_size != unit_size
-            or current_page + unit_page > indexer_page
+            unit_ratio != current_ratio or current_page + unit_page > indexer_page
         ):
             append_hot_group(current)
             current = []
             current_page = 0
-            current_page_size = None
+            current_ratio = None
         current.extend(unit)
         current_page += unit_page
-        current_page_size = unit_size
+        current_ratio = unit_ratio
     if current:
         append_hot_group(current)
 
