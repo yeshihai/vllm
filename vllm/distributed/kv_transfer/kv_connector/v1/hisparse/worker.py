@@ -362,6 +362,11 @@ class HiSparseConnectorWorker:
         self._initialized = True
 
     def set_request_state_indices(self, indices: torch.Tensor) -> None:
+        # The runtime may rebind its request-state tensor between the
+        # profiling and the real KV cache, so never keep a stale alias.
+        runtime_state = self.cache_handles[0].runtime.request_state_indices
+        if runtime_state is not None and runtime_state is not self.request_state_indices:
+            self.request_state_indices = runtime_state
         if indices.numel() > self.request_state_indices.numel():
             raise ValueError(
                 "HiSparse request-state mapping exceeds max_num_seqs: "
