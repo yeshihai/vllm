@@ -349,6 +349,7 @@ class HiSparseConnectorWorker:
         self._metrics_calls = 0
         self._metrics_event = torch.Event()
         self._metrics_pending = False
+        self._active_request_ids: set[str] = set()
         self._init_dma()
         if self.is_host_writer:
             for layer_index, handle in enumerate(cache_handles):
@@ -374,6 +375,32 @@ class HiSparseConnectorWorker:
         if self._pending_invalid_block_ids:
             self.invalidate_blocks(self._pending_invalid_block_ids, indices)
             self._pending_invalid_block_ids.clear()
+
+    def _reset_new_request_hot_rows(
+        self,
+        request_ids: list[str] | None,
+        request_state_indices: torch.Tensor,
+    ) -> None:
+        """Reused state rows must not serve the previous request's hot rows."""
+        if not request_ids:
+            return
+        new_positions = [
+            position
+            for position, request_id in enumerate(request_ids)
+            if request_id not in self._active_request_ids
+        ]
+        self._active_request_ids = set(request_ids)
+        if not new_positions:
+            return
+        positions = torch.tensor(
+            new_positions, dtype=torch.long, device=request_state_indices.device
+        )
+        state_rows = request_state_indices.index_select(0, positions).long()
+        state_rows = state_rows[state_rows >= 0]
+        if self.residency is not None:
+            self.residency[:, state_rows, :] = 0
+        for runtime in self.leader_runtimes:
+            runtime.reset_hot_rows(state_rows)
 
     def _init_dma(self) -> None:
         host_caches = tuple(cache.runtime.host_cache for cache in self.cache_handles)
@@ -452,6 +479,7 @@ class HiSparseConnectorWorker:
         self._pending_invalid_block_ids.extend(metadata.source_block_ids)
         if request_state_indices is not None:
             self.set_request_state_indices(request_state_indices)
+            self._reset_new_request_hot_rows(request_ids, request_state_indices)
         if metadata.residency_updates:
             assert self.residency is not None
             assert request_state_indices is not None and request_ids is not None

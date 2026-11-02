@@ -930,6 +930,19 @@ class HiSparseRuntime:
         group.swap_stats.zero_()
         group.copy_stream.wait_stream(compute_stream)
 
+    def reset_hot_rows(self, state_rows: torch.Tensor) -> None:
+        """Drop hot bookkeeping for state rows that switched to a new request."""
+        if state_rows.numel() == 0:
+            return
+        group = self.index_group
+        compute_stream = torch.accelerator.current_stream()
+        compute_stream.wait_stream(group.copy_stream)
+        group.device_global_indices.index_fill_(0, state_rows, -1)
+        group.lru_slots.index_copy_(
+            0, state_rows, group.lru_init.expand(state_rows.numel(), -1)
+        )
+        group.copy_stream.wait_stream(compute_stream)
+
     def invalidate_sorted_slots(
         self,
         sorted_slots: torch.Tensor,
