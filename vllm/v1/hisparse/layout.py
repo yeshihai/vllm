@@ -242,6 +242,7 @@ def _lay_out_hisparse_groups(
                 HiSparseResidentSpec(
                     block_size=gpu_block_size,
                     page_size=page_size,
+                    storage_block_size=storage_block_size,
                 ),
                 enable_kv_transfer=False,
             )
@@ -253,6 +254,7 @@ def _lay_out_hisparse_groups(
                     block_size=gpu_block_size,
                     page_size=page_size,
                     blocks_per_request=hot_blocks_per_request,
+                    storage_block_size=storage_block_size,
                 ),
                 enable_kv_transfer=False,
             )

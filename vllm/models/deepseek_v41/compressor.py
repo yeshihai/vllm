@@ -460,7 +460,10 @@ class DeepseekCompressor(nn.Module):
                 if self.compress_ratio > 1:
                     # Resident slots are per-token rows of the logical block;
                     # the compressed cache stores ratio tokens per state.
-                    logical = self.block_size
+                    logical = (
+                        hisparse_cache.runtime.logical_block_size
+                        or self.block_size
+                    )
                     storage = resident.block_size
                     boundary = (
                         positions[:num_tokens] + 1

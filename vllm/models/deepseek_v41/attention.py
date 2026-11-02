@@ -569,9 +569,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 row_width=row_width,
                 kv_dtype=torch.uint8,
                 row_value_bytes=row_value_bytes,
-                storage_block_size=(
-                    cache_config.block_size // self.compress_ratio
-                ),
             )
             assert self.hisparse_cache is not None
 
