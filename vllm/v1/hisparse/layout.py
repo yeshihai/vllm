@@ -91,17 +91,42 @@ def get_hisparse_host_pool_bytes(vllm_config: VllmConfig) -> int:
 
 def _partition_hisparse_specs(
     groups: list[KVCacheGroupSpec],
-) -> tuple[dict[str, MLAAttentionSpec], dict[str, MLAAttentionSpec]]:
+) -> tuple[
+    dict[str, MLAAttentionSpec], dict[str, MLAAttentionSpec], dict[str, KVCacheSpec]
+]:
     group_spec = groups[0].kv_cache_spec
     if not isinstance(group_spec, UniformTypeKVCacheSpecs):
         raise ValueError("HiSparse requires uniform sparse-MLA cache specs.")
 
-    specs = group_spec.kv_cache_specs
-    if any(
-        isinstance(spec, MLAAttentionSpec) and spec.model_version == "deepseek_v4"
+    all_specs = group_spec.kv_cache_specs
+    specs = all_specs
+    model_versions = {
+        spec.model_version
         for spec in specs.values()
-    ):
-        raise ValueError("HiSparse does not support DeepSeek V4.")
+        if isinstance(spec, MLAAttentionSpec)
+    }
+    if "deepseek_v4" in model_versions:
+        specs = {
+            name: spec
+            for name, spec in all_specs.items()
+            if isinstance(spec, MLAAttentionSpec) and spec.tokens_per_state == 4
+        }
+        if not specs:
+            raise ValueError(
+                "HiSparse requires DeepSeek V4 to expose C4 MLA cache layers."
+            )
+    elif "deepseek_v41" in model_versions:
+        # Decode-first narrow support: only the ratio-1 compressed cache group
+        # is host-backed; ratio-2 layers stay resident on the GPU.
+        specs = {
+            name: spec
+            for name, spec in all_specs.items()
+            if isinstance(spec, MLAAttentionSpec) and spec.tokens_per_state == 1
+        }
+        if not specs:
+            raise ValueError(
+                "HiSparse requires DeepSeek V4.1 to expose C1 MLA cache layers."
+            )
     if not all(isinstance(spec, MLAAttentionSpec) for spec in specs.values()):
         raise ValueError("HiSparse requires its first cache group to contain MLA only.")
 
@@ -119,13 +144,16 @@ def _partition_hisparse_specs(
     }
     if not source_specs or not indexer_specs:
         raise ValueError("HiSparse requires sparse-MLA and indexer cache specs.")
-    return source_specs, indexer_specs
+    remaining_specs = {
+        name: spec for name, spec in all_specs.items() if name not in specs
+    }
+    return source_specs, indexer_specs, remaining_specs
 
 
 def _lay_out_hisparse_groups(
     vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]
 ) -> list[KVCacheGroupSpec]:
-    source_specs, indexer_specs = _partition_hisparse_specs(groups)
+    source_specs, indexer_specs, remaining_specs = _partition_hisparse_specs(groups)
     block_sizes = {
         spec.block_size for spec in (*source_specs.values(), *indexer_specs.values())
     }
@@ -144,16 +172,33 @@ def _lay_out_hisparse_groups(
         gpu_block_size,
     )
     assert config is not None
+    # Indexer caches and any remaining GPU-resident MLA caches are all
+    # token-indexed full-length groups. Fold them into one group so a request
+    # consumes one set of block ids instead of one set per group.
+    merged_specs = {
+        **indexer_specs,
+        **{
+            name: spec
+            for name, spec in remaining_specs.items()
+            if isinstance(spec, MLAAttentionSpec)
+        },
+    }
     indexer_group_spec = UniformTypeKVCacheSpecs.from_specs(
-        cast(dict[str, KVCacheSpec], indexer_specs)
+        cast(dict[str, KVCacheSpec], merged_specs)
     )
     assert indexer_group_spec is not None
     indexer_group = KVCacheGroupSpec(
-        list(indexer_specs),
+        list(merged_specs),
         indexer_group_spec,
         enable_kv_transfer=True,
         role=KVCacheGroupRole.HISPARSE_INDEXER,
+        is_eagle_group=groups[0].is_eagle_group,
     )
+    remaining_specs = {
+        name: spec
+        for name, spec in remaining_specs.items()
+        if name not in merged_specs
+    }
 
     indexer_page = sum(spec.page_size_bytes for spec in indexer_specs.values())
     hot_blocks_per_request = cdiv(config.device_buffer_size, gpu_block_size)
@@ -224,7 +269,20 @@ def _lay_out_hisparse_groups(
         host_resident=True,
         enable_kv_transfer=True,
     )
-    regular_groups = groups[1:]
+    regular_groups = list(groups[1:])
+    if remaining_specs:
+        remaining_group_spec = UniformTypeKVCacheSpecs.from_specs(
+            cast(dict[str, KVCacheSpec], remaining_specs)
+        )
+        assert remaining_group_spec is not None
+        regular_groups.insert(
+            0,
+            KVCacheGroupSpec(
+                list(remaining_specs),
+                remaining_group_spec,
+                is_eagle_group=groups[0].is_eagle_group,
+            ),
+        )
     return [
         source_group,
         indexer_group,
