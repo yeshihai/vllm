@@ -426,11 +426,14 @@ class HiSparseConnectorWorker:
         self.host_caches = host_caches
         self.resident_caches = tuple(resident_caches)
 
-        for resident_cache, host_cache in zip(resident_caches, host_caches):
+        for cache, resident_cache, host_cache in zip(
+            self.cache_handles, resident_caches, host_caches
+        ):
             row_bytes = resident_cache.shape[-1] * resident_cache.element_size()
+            page_rows = cache.runtime.storage_block_size or resident_cache.shape[1]
             if (
                 resident_cache.ndim != 3
-                or resident_cache.shape[1] != self.kernel_block_size
+                or resident_cache.shape[1] != page_rows
                 or resident_cache.stride(1) * resident_cache.element_size() != row_bytes
             ):
                 raise RuntimeError("HiSparse DMA requires contiguous resident rows.")
@@ -603,11 +606,12 @@ class HiSparseConnectorWorker:
         device = self.cache_handles[0].runtime.device
         staging = torch.tensor(block_ids, dtype=torch.int32, pin_memory=True)
         blocks = staging.to(device, dtype=torch.int32, non_blocking=True)
-        offsets = torch.arange(self.kernel_block_size, dtype=torch.int32, device=device)
-        slots = (blocks[:, None] * self.kernel_block_size + offsets[None, :]).flatten()
-        sorted_slots = torch.sort(slots).values
         state_indices = request_state_indices.to(device=device, dtype=torch.long)
         for runtime in self.leader_runtimes:
+            page_rows = runtime.storage_block_size or self.kernel_block_size
+            offsets = torch.arange(page_rows, dtype=torch.int32, device=device)
+            slots = (blocks[:, None] * page_rows + offsets[None, :]).flatten()
+            sorted_slots = torch.sort(slots).values
             runtime.invalidate_sorted_slots(sorted_slots, state_indices)
 
     def reset_hot_state(self) -> None:
@@ -823,8 +827,8 @@ class HiSparseConnectorWorker:
             source_index = cache.runtime.resident_source_index
             source = self.host_caches[layer_index]
             destination = self.resident_caches[layer_index]
+            page_rows = cache.runtime.storage_block_size or self.kernel_block_size
             for transfer in transfers:
-                host_start = transfer.host_block_id * self.kernel_block_size
                 resident_block = transfer.resident_block_ids[source_index]
                 # Each import pays one H2D page copy and enqueue per layer/rank
                 # instead of tail prefill on D. Restore the prompt rows before
@@ -833,10 +837,13 @@ class HiSparseConnectorWorker:
                 # cudaHostRegister pins this pool outside PyTorch's allocator,
                 # so the sync checker cannot recognize it via is_pinned().
                 with gpu_sync_allowed():
-                    destination[resident_block].copy_(
-                        source[host_start : host_start + self.kernel_block_size],
-                        non_blocking=True,
-                    )
+                    if source.ndim == 3:
+                        # Split paged host cache: one page per host block.
+                        page = source[transfer.host_block_id]
+                    else:
+                        host_start = transfer.host_block_id * page_rows
+                        page = source[host_start : host_start + page_rows]
+                    destination[resident_block].copy_(page, non_blocking=True)
         self._record_transfer_completion(
             transfers, stream=torch.accelerator.current_stream()
         )
@@ -853,8 +860,8 @@ class HiSparseConnectorWorker:
         num_layers = len(self.cache_handles)
         descriptor_count = len(transfers) * num_layers
         descriptors = self._acquire_dma_descriptors(descriptor_count)
-        destination_rows = np.fromiter(
-            (transfer.host_block_id * self.kernel_block_size for transfer in transfers),
+        host_blocks = np.fromiter(
+            (transfer.host_block_id for transfer in transfers),
             dtype=np.int64,
             count=len(transfers),
         )
@@ -869,25 +876,42 @@ class HiSparseConnectorWorker:
             source_index = cache.runtime.resident_source_index
             if source_index >= source_blocks_by_transfer.shape[1]:
                 raise RuntimeError("HiSparse spill DMA source index is out of range.")
+            page_rows = cache.runtime.storage_block_size or self.kernel_block_size
             source_blocks = source_blocks_by_transfer[:, source_index]
             source = self.resident_caches[layer_index]
             destination = self.host_caches[layer_index]
+            row_bytes = source.shape[-1] * source.element_size()
             if np.any(source_blocks < 0) or np.any(source_blocks >= source.shape[0]):
                 raise RuntimeError("HiSparse spill DMA source is out of range.")
-            if np.any(destination_rows < 0) or np.any(
-                destination_rows + self.kernel_block_size > destination.shape[0]
-            ):
-                raise RuntimeError("HiSparse spill DMA destination is out of range.")
-            row_bytes = source.shape[-1] * source.element_size()
+            if destination.ndim == 3:
+                if np.any(host_blocks < 0) or np.any(
+                    host_blocks >= destination.shape[0]
+                ):
+                    raise RuntimeError(
+                        "HiSparse spill DMA destination is out of range."
+                    )
+                destination_offsets = (
+                    destination.data_ptr()
+                    + host_blocks
+                    * destination.stride(0)
+                    * destination.element_size()
+                )
+            else:
+                row_starts = host_blocks * page_rows
+                if np.any(row_starts < 0) or np.any(
+                    row_starts + page_rows > destination.shape[0]
+                ):
+                    raise RuntimeError(
+                        "HiSparse spill DMA destination is out of range."
+                    )
+                destination_offsets = destination.data_ptr() + row_starts * row_bytes
             descriptor_slice = slice(layer_index, descriptor_count, num_layers)
             descriptors.src_np[descriptor_slice] = (
                 source.data_ptr()
                 + source_blocks * source.stride(0) * source.element_size()
             )
-            descriptors.dst_np[descriptor_slice] = (
-                destination.data_ptr() + destination_rows * row_bytes
-            )
-            descriptors.sizes_np[descriptor_slice] = self.kernel_block_size * row_bytes
+            descriptors.dst_np[descriptor_slice] = destination_offsets
+            descriptors.sizes_np[descriptor_slice] = page_rows * row_bytes
         self._submit_dma_descriptors(
             descriptors,
             descriptor_count,

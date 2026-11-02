@@ -116,16 +116,18 @@ def _partition_hisparse_specs(
                 "HiSparse requires DeepSeek V4 to expose C4 MLA cache layers."
             )
     elif "deepseek_v41" in model_versions:
-        # Decode-first narrow support: only the ratio-1 compressed cache group
-        # is host-backed; ratio-2 layers stay resident on the GPU.
+        # Both compressed caches are sparse top-k retrievals: C1 (one state per
+        # token) and C2 (one state per two tokens) can share the host-backed
+        # path. Keep every MLA spec so both source and indexer groups are laid
+        # out; each source keeps its own storage block size (64 / 32 rows).
         specs = {
             name: spec
             for name, spec in all_specs.items()
-            if isinstance(spec, MLAAttentionSpec) and spec.tokens_per_state == 1
+            if isinstance(spec, MLAAttentionSpec)
         }
         if not specs:
             raise ValueError(
-                "HiSparse requires DeepSeek V4.1 to expose C1 MLA cache layers."
+                "HiSparse requires DeepSeek V4.1 to expose MLA cache layers."
             )
     if not all(isinstance(spec, MLAAttentionSpec) for spec in specs.values()):
         raise ValueError("HiSparse requires its first cache group to contain MLA only.")
@@ -201,7 +203,6 @@ def _lay_out_hisparse_groups(
     }
 
     indexer_page = sum(spec.page_size_bytes for spec in indexer_specs.values())
-    hot_blocks_per_request = cdiv(config.device_buffer_size, gpu_block_size)
     hot_units: list[list[tuple[str, MLAAttentionSpec]]] = []
     for layer_name, layer_spec in source_specs.items():
         if layer_spec.is_index_group_leader or not hot_units:
@@ -218,7 +219,19 @@ def _lay_out_hisparse_groups(
                 "HiSparse hot-cache groups require one page size, got "
                 f"{sorted(page_sizes)}."
             )
+        ratios = {spec.tokens_per_state for _, spec in layers}
+        if len(ratios) != 1:
+            raise ValueError(
+                "HiSparse hot-cache groups require one compression ratio, got "
+                f"{sorted(ratios)}."
+            )
         page_size = page_sizes.pop()
+        # The hot cache holds one row per compressed state, so a ratio-r
+        # source packs r states per logical token block.
+        storage_block_size = gpu_block_size // ratios.pop()
+        hot_blocks_per_request = cdiv(
+            config.device_buffer_size, storage_block_size
+        )
         names = [name for name, _ in layers]
         resident_groups.append(
             KVCacheGroupSpec(
@@ -247,14 +260,27 @@ def _lay_out_hisparse_groups(
 
     current: list[tuple[str, MLAAttentionSpec]] = []
     current_page = 0
+    current_page_size: int | None = None
     for unit in hot_units:
         unit_page = sum(spec.page_size_bytes for _, spec in unit)
-        if current and current_page + unit_page > indexer_page:
+        unit_sizes = {spec.page_size_bytes for _, spec in unit}
+        if len(unit_sizes) != 1:
+            raise ValueError(
+                "HiSparse hot-cache units require one page size, got "
+                f"{sorted(unit_sizes)}."
+            )
+        unit_size = unit_sizes.pop()
+        if current and (
+            current_page_size != unit_size
+            or current_page + unit_page > indexer_page
+        ):
             append_hot_group(current)
             current = []
             current_page = 0
+            current_page_size = None
         current.extend(unit)
         current_page += unit_page
+        current_page_size = unit_size
     if current:
         append_hot_group(current)
 

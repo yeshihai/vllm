@@ -547,7 +547,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if (
             vllm_config.attention_config.hisparse_config is not None
             and self.is_kv_source
-            and self.compress_ratio == 1
+            and self.compress_ratio in (1, 2)
         ):
             if not self.supports_hisparse:
                 raise NotImplementedError(
@@ -569,6 +569,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 row_width=row_width,
                 kv_dtype=torch.uint8,
                 row_value_bytes=row_value_bytes,
+                storage_block_size=(
+                    cache_config.block_size // self.compress_ratio
+                ),
             )
             assert self.hisparse_cache is not None
 
