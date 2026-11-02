@@ -568,7 +568,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 is_index_group_leader=True,
                 row_width=row_width,
                 kv_dtype=torch.uint8,
-                storage_block_size=cache_config.block_size,
                 row_value_bytes=row_value_bytes,
             )
             assert self.hisparse_cache is not None
