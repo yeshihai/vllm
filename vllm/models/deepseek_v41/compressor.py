@@ -443,3 +443,30 @@ class DeepseekCompressor(nn.Module):
             self.compress_ratio,
             fp8_scale=fp8_scale,
         )
+        hisparse_cache = k_cache_layer.hisparse_cache
+        if hisparse_cache is not None:
+            # The source pool is host-resident, but the scheduler also promotes
+            # pages into the GPU resident cache and the decoder prefers those
+            # rows. Mirror the row the host write just produced into the
+            # resident slot so both copies agree.
+            resident = hisparse_cache.view
+            resident_slots = hisparse_cache.slot_mapping
+            if resident is not None and resident_slots is not None:
+                num_tokens = min(
+                    k_cache_metadata.slot_mapping.numel(), resident_slots.numel()
+                )
+                rope_quant_insert(
+                    latent,
+                    positions,
+                    rotary_emb.cos_sin_cache,
+                    resident.cache,
+                    resident_slots[:num_tokens],
+                    self.compress_ratio,
+                    fp8_scale=fp8_scale,
+                )
+            # The write bypassed the hot bookkeeping, so drop any stale hot
+            # copy of the same global slots before the next swap-in.
+            hisparse_cache.runtime.invalidate_written_slots(
+                k_cache_metadata.slot_mapping,
+                k_cache_metadata.req_id_per_token,
+            )
