@@ -1144,6 +1144,20 @@ def update_kv_cache_capacity(
     pools = _kv_cache_device_name(vllm_config)
     if vllm_config.attention_config.hisparse_config is not None:
         pools += " + host"
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        logger.info(
+            "KV capacity group: host=%s spec=%s layers=%d "
+            "blocks_per_request=%d page_bytes=%d",
+            group.host_resident,
+            type(spec).__name__,
+            len(group.layer_names),
+            cdiv(
+                spec.max_memory_usage_bytes(vllm_config),
+                spec.page_size_bytes,
+            ),
+            spec.page_size_bytes,
+        )
     logger.info_once(
         "%s KV cache size: %s tokens, "
         "Maximum concurrency for %s tokens per request: %.2fx",
