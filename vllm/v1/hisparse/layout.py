@@ -423,6 +423,21 @@ def get_hisparse_kv_cache_config(
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, device_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(device_groups, layout)
+    from vllm.v1.core.kv_cache_planning import _get_per_layer_spec
+
+    for group in device_groups:
+        group_bytes = sum(
+            _get_per_layer_spec(group, layer_name).page_size_bytes
+            for layer_name in group.layer_names
+        )
+        logger.info(
+            "HiSparse device group: spec=%s layers=%d page_sum=%d group_page=%d",
+            type(group.kv_cache_spec).__name__,
+            len(group.layer_names),
+            group_bytes,
+            group.kv_cache_spec.page_size_bytes,
+        )
+    logger.info("HiSparse device bytes_per_block=%d", bytes_per_block)
     num_blocks = may_override_num_blocks(
         vllm_config, available_memory // bytes_per_block
     )
