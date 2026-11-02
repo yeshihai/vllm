@@ -798,6 +798,9 @@ class HiSparseRuntime:
         self.eager_host_mirror = config.eager_host_mirror
         self.resident_source_index = -1
         self.request_state_indices: torch.Tensor | None = None
+        # Set once the connector binds a scheduled batch, which warmup runs do
+        # not do; diagnostics use it to skip dummy forwards.
+        self.real_batch_seen = False
         self.host_pool: HiSparseHostPool | None = None
 
     @property

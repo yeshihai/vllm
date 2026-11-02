@@ -374,6 +374,9 @@ class HiSparseConnectorWorker:
             )
         if self.backend.is_current_stream_capturing():
             return
+        if indices.numel():
+            for handle in self.cache_handles:
+                handle.runtime.real_batch_seen = True
         # Attention indexes persistent request state by input-batch row. Refresh
         # that indirection after every batch compaction or reorder.
         if os.environ.get("VLLM_HISPARSE_DEBUG"):
