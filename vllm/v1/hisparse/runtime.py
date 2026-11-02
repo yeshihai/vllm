@@ -856,11 +856,14 @@ class HiSparseRuntime:
         if self.row_value_bytes is not None:
             host_cache = kv_cache
             if host_cache.dim() == 4:
-                if host_cache.shape[1] != 1:
+                if host_cache.shape[1] == 1:
+                    host_cache = host_cache.squeeze(1)
+                elif host_cache.shape[2] == 1:
+                    host_cache = host_cache.squeeze(2)
+                else:
                     raise ValueError(
                         "HiSparse split-page host cache must have one KV head."
                     )
-                host_cache = host_cache.squeeze(1)
             if host_cache.dim() != 3:
                 raise ValueError(
                     "HiSparse split-page host cache must be a 3D paged cache, "
