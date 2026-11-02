@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -243,6 +244,61 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     )
                     source._hisparse_decode_results[key] = cached
                 global_indices, topk_lens = cached
+                if os.environ.get("VLLM_HISPARSE_DEBUG") and not getattr(
+                    self, "_hisparse_debug_done", False
+                ):
+                    self._hisparse_debug_done = True
+                    expected, expected_lens = compute_global_topk_indices_and_lens(
+                        self.topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        swa_metadata.is_valid_token[:num_decode_tokens],
+                    )
+                    host = self._compressed_kv_cache()
+                    hot = hisparse_cache.runtime.hot.cache
+                    abs_stride = hisparse_cache.runtime.hot.attention_block_stride
+                    hflat = host.as_strided((host.untyped_storage().nbytes(),), (1,), 0)
+                    oflat = hot.as_strided((hot.untyped_storage().nbytes(),), (1,), 0)
+                    hbase, obase = host.storage_offset(), hot.storage_offset()
+                    hstride, ostride = host.stride(0), hot.stride(0)
+                    checked = mismatched = 0
+                    for r in range(num_decode_tokens):
+                        for c in range(expected.shape[1]):
+                            e = int(expected[r, c])
+                            p = int(global_indices[r, c])
+                            if e < 0 or p < 0:
+                                continue
+                            hb, ho = divmod(e, block_size)
+                            ob, oo = divmod(p, abs_stride)
+                            hs = (
+                                hbase + hb * hstride + ho * 576,
+                                hbase + hb * hstride + block_size * 576 + ho * 8,
+                            )
+                            os_ = (
+                                obase + ob * ostride + oo * 576,
+                                obase + ob * ostride + block_size * 576 + oo * 8,
+                            )
+                            checked += 1
+                            if not torch.equal(
+                                hflat[hs[0] : hs[0] + 576].cpu(),
+                                oflat[os_[0] : os_[0] + 576].cpu(),
+                            ) or not torch.equal(
+                                hflat[hs[1] : hs[1] + 8].cpu(),
+                                oflat[os_[1] : os_[1] + 8].cpu(),
+                            ):
+                                mismatched += 1
+                    print(
+                        "HISPARSE_DEBUG",
+                        "layer", self.layer_id,
+                        "abs", abs_stride,
+                        "bs", block_size,
+                        "exp_lens", expected_lens[:4].tolist(),
+                        "hisp_lens", topk_lens[:4].tolist(),
+                        "checked", checked,
+                        "mismatch", mismatched,
+                        flush=True,
+                    )
                 kv_cache = hisparse_cache.runtime.hot.attention_cache
             else:
                 assert swa_metadata.is_valid_token is not None
