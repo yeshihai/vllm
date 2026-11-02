@@ -1166,7 +1166,13 @@ class HiSparseRuntime:
         shared_rows = self._step_rows(num_tokens)
         group = self.index_group
         hot = self.hot
-        assert hot.block_size == block_size
+        assert hot.block_size == block_size, (
+            "HiSparse hot block mismatch:",
+            hot.block_size,
+            block_size,
+            self.storage_block_size,
+            self.row_width,
+        )
         assert hot.attention_block_stride == group.leader.hot.attention_block_stride
 
         if self.is_group_leader:
