@@ -310,6 +310,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                                     oflat[os_s : os_s + scale_bytes].cpu(),
                                 )
                             mismatched += int(mismatch)
+                    runtime = hisparse_cache.runtime
+                    group = runtime.index_group
+                    state = runtime.request_state_indices
+                    state0 = int(state[0]) if state is not None else -1
+                    resid = hisparse_cache.residency
+                    ridx = runtime.resident_source_index
                     print(
                         "HISPARSE_DEBUG",
                         "layer", self.layer_id,
@@ -324,10 +330,22 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         "host_zero", host_zero,
                         "h_sums", h_sums[:6],
                         "o_sums", o_sums[:6],
+                        "swap_counts", group.shared_topk.swap_counts[:4].tolist(),
+                        "swap_dev",
+                        group.shared_topk.swap_device_physical_rows[:1, :6].tolist(),
+                        "dgi",
+                        None
+                        if state0 < 0
+                        else group.device_global_indices[state0, :6].tolist(),
+                        "res",
+                        None
+                        if resid is None or ridx < 0 or state0 < 0
+                        else resid[ridx, state0, :6].tolist(),
+                        "ostride", ostride,
+                        "hstride", hstride,
                         "req_ids",
                         attn_metadata.req_id_per_token[:num_decode_tokens].tolist(),
-                        "state",
-                        hisparse_cache.runtime.request_state_indices[:8].tolist(),
+                        "state", state[:8].tolist() if state is not None else None,
                         "bt", attn_metadata.block_table[:1, :4].tolist(),
                         "topk", self.topk_indices_buffer[:1, :8].tolist(),
                         "exp", expected[:1, :8].tolist(),
