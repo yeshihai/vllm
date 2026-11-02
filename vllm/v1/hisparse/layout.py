@@ -61,24 +61,46 @@ def get_hisparse_kv_cache_groups(
         for name, spec in kv_cache_spec.items()
         if isinstance(spec, MLAAttentionSpec)
     }
-    other_specs = {
-        name: spec
-        for name, spec in kv_cache_spec.items()
-        if not isinstance(
-            spec, (MLAAttentionSpec, HiSparseResidentSpec, HiSparseHotSpec)
-        )
-    }
     if not mla_specs:
         return None
 
+    from copy import copy
+
     from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 
-    mla_group_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
-    assert mla_group_spec is not None
-    mla_group = KVCacheGroupSpec(list(mla_specs), mla_group_spec)
-    regular_groups = (
-        get_kv_cache_groups(vllm_config, other_specs) if other_specs else []
-    )
+    # Group the whole cache map exactly like the non-HiSparse engine would.
+    # Grouping the non-MLA specs alone drops the MLA group's page span from the
+    # packing budget, which degenerates the sliding-window layers into one
+    # group per layer and triples the blocks a request consumes.
+    plain_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if not isinstance(spec, (HiSparseResidentSpec, HiSparseHotSpec))
+    }
+    shim = copy(vllm_config)
+    shim.attention_config = copy(vllm_config.attention_config)
+    shim.attention_config.hisparse_config = None
+    default_groups = get_kv_cache_groups(shim, dict(plain_specs))
+
+    def is_mla_group(group: KVCacheGroupSpec) -> bool:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            return any(
+                isinstance(layer_spec, MLAAttentionSpec)
+                for layer_spec in spec.kv_cache_specs.values()
+            )
+        return isinstance(spec, MLAAttentionSpec)
+
+    mla_groups = [group for group in default_groups if is_mla_group(group)]
+    if len(mla_groups) == 1:
+        mla_group = mla_groups[0]
+    else:
+        mla_group_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
+        assert mla_group_spec is not None
+        mla_group = KVCacheGroupSpec(list(mla_specs), mla_group_spec)
+    regular_groups = [
+        group for group in default_groups if not is_mla_group(group)
+    ]
     return _lay_out_hisparse_groups(vllm_config, [mla_group, *regular_groups])
 
 
