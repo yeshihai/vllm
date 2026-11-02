@@ -443,3 +443,11 @@ class DeepseekCompressor(nn.Module):
             self.compress_ratio,
             fp8_scale=fp8_scale,
         )
+        hisparse_cache = k_cache_layer.hisparse_cache
+        if hisparse_cache is not None:
+            # The write bypassed the hot cache, so drop any stale hot copy of
+            # the same global slots before the next swap-in.
+            hisparse_cache.runtime.invalidate_written_slots(
+                k_cache_metadata.slot_mapping,
+                k_cache_metadata.req_id_per_token,
+            )

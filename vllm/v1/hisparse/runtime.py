@@ -43,9 +43,13 @@ _MIN_STAGED_PREFILL_KV_ROWS = 256
 
 
 def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
+    if attn_metadata is None:
+        return False
+    # Shared compressed caches expose request-level metadata without a
+    # separate decode count; a uniform single-token batch is all-decode.
+    num_decode_tokens = getattr(attn_metadata, "num_decode_tokens", 0)
     return (
-        attn_metadata is not None
-        and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
+        num_decode_tokens == attn_metadata.num_actual_tokens
         and attn_metadata.max_query_len == 1
         and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
     )
@@ -1246,14 +1250,20 @@ class HiSparseCacheHandle:
             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
         )
         self.num_decode_tokens = (
-            attn_metadata.num_decode_tokens if attn_metadata is not None else 0
+            getattr(attn_metadata, "num_decode_tokens", 0)
+            if attn_metadata is not None
+            else 0
         )
         self.req_id_per_token = (
             attn_metadata.req_id_per_token if attn_metadata is not None else None
         )
         self.decode_batch = is_hisparse_decode_batch(attn_metadata)
-        self.host_mirror_required = attn_metadata is not None and (
-            not self.decode_batch or self.runtime.eager_host_mirror
+        # Split-page caches are written straight to the host pool, so the
+        # per-layer device mirror is neither needed nor valid for them.
+        self.host_mirror_required = (
+            attn_metadata is not None
+            and self.runtime.row_value_bytes is None
+            and (not self.decode_batch or self.runtime.eager_host_mirror)
         )
 
     def write_target(

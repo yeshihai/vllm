@@ -392,10 +392,17 @@ class HiSparseConnectorWorker:
                 or resident_cache.stride(1) * resident_cache.element_size() != row_bytes
             ):
                 raise RuntimeError("HiSparse DMA requires contiguous resident rows.")
-            if (
-                host_cache.ndim != 2
-                or not host_cache.is_contiguous()
-                or host_cache.shape[1] * host_cache.element_size() != row_bytes
+            host_rows_ok = host_cache.ndim == 2 and host_cache.is_contiguous()
+            if host_cache.ndim == 3:
+                # Split-page host caches keep scales in a block-wide tail;
+                # whole-page copies stay valid in this paged layout.
+                host_rows_ok = (
+                    host_cache.stride(-1) == 1
+                    and host_cache.stride(1) * host_cache.element_size()
+                    == row_bytes
+                )
+            if not host_rows_ok or (
+                host_cache.shape[-1] * host_cache.element_size() != row_bytes
             ):
                 raise RuntimeError("HiSparse DMA requires contiguous host rows.")
 
