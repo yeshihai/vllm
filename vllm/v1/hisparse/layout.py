@@ -172,16 +172,33 @@ def _lay_out_hisparse_groups(
         gpu_block_size,
     )
     assert config is not None
+    # Indexer caches and any remaining GPU-resident MLA caches are all
+    # token-indexed full-length groups. Fold them into one group so a request
+    # consumes one set of block ids instead of one set per group.
+    merged_specs = {
+        **indexer_specs,
+        **{
+            name: spec
+            for name, spec in remaining_specs.items()
+            if isinstance(spec, MLAAttentionSpec)
+        },
+    }
     indexer_group_spec = UniformTypeKVCacheSpecs.from_specs(
-        cast(dict[str, KVCacheSpec], indexer_specs)
+        cast(dict[str, KVCacheSpec], merged_specs)
     )
     assert indexer_group_spec is not None
     indexer_group = KVCacheGroupSpec(
-        list(indexer_specs),
+        list(merged_specs),
         indexer_group_spec,
         enable_kv_transfer=True,
         role=KVCacheGroupRole.HISPARSE_INDEXER,
+        is_eagle_group=groups[0].is_eagle_group,
     )
+    remaining_specs = {
+        name: spec
+        for name, spec in remaining_specs.items()
+        if name not in merged_specs
+    }
 
     indexer_page = sum(spec.page_size_bytes for spec in indexer_specs.values())
     hot_blocks_per_request = cdiv(config.device_buffer_size, gpu_block_size)
