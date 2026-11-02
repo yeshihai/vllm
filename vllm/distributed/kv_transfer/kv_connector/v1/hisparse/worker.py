@@ -381,7 +381,10 @@ class HiSparseConnectorWorker:
         self.request_state_indices.fill_(-1)
         self.request_state_indices[: indices.numel()].copy_(indices)
         if self._pending_invalid_block_ids:
-            self.invalidate_blocks(self._pending_invalid_block_ids, indices)
+            self.invalidate_blocks(
+                self._pending_invalid_block_ids,
+                self.request_state_indices[: indices.numel()],
+            )
             self._pending_invalid_block_ids.clear()
 
     def _reset_new_request_hot_rows(
@@ -403,7 +406,8 @@ class HiSparseConnectorWorker:
         positions = torch.tensor(
             new_positions, dtype=torch.long, device=request_state_indices.device
         )
-        state_rows = request_state_indices.index_select(0, positions).long()
+        runtime_state = self.cache_handles[0].runtime.request_state_indices
+        state_rows = runtime_state.index_select(0, positions).long()
         state_rows = state_rows[state_rows >= 0]
         if self.residency is not None:
             self.residency[:, state_rows, :] = 0
@@ -503,7 +507,7 @@ class HiSparseConnectorWorker:
                 self.residency,
                 metadata.residency_updates,
                 request_ids,
-                request_state_indices,
+                self.request_state_indices,
             )
 
     def _clear_forward_mirror_state(self) -> None:

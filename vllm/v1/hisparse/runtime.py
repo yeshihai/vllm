@@ -1359,8 +1359,10 @@ def initialize_hisparse_runtime_buffers(
     resident = cache_handles[0].view
     assert resident is not None
     device = resident.cache.device
-    request_state_indices = torch.full(
-        (max_num_reqs,), -1, dtype=torch.int32, device=device
+    # Identity rows keep the hot state usable when the connector has not
+    # rebound its request-state view yet; a real mapping overwrites them.
+    request_state_indices = torch.arange(
+        max_num_reqs, dtype=torch.int32, device=device
     )
     for cache_handle in cache_handles:
         cache_handle.runtime.request_state_indices = request_state_indices
