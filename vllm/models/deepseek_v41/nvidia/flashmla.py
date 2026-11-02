@@ -297,6 +297,13 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         "hisp_lens", topk_lens[:4].tolist(),
                         "checked", checked,
                         "mismatch", mismatched,
+                        "req_ids",
+                        attn_metadata.req_id_per_token[:num_decode_tokens].tolist(),
+                        "state",
+                        hisparse_cache.runtime.request_state_indices[:8].tolist(),
+                        "bt", attn_metadata.block_table[:1, :4].tolist(),
+                        "topk", self.topk_indices_buffer[:1, :8].tolist(),
+                        "exp", expected[:1, :8].tolist(),
                         flush=True,
                     )
                 kv_cache = hisparse_cache.runtime.hot.attention_cache
