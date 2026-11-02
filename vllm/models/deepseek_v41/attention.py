@@ -547,7 +547,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if (
             vllm_config.attention_config.hisparse_config is not None
             and self.is_kv_source
-            and self.compress_ratio == 1
+            and self.compress_ratio in (1, 2)
         ):
             if not self.supports_hisparse:
                 raise NotImplementedError(

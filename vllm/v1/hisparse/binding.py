@@ -231,6 +231,7 @@ def bind_hisparse_kv_caches(
                 block_size=group.kv_cache_spec.block_size,
                 block_table=residency[resident_source_index],
                 slot_mapping=block_tables.slot_mappings[group_id],
+                storage_block_size=group.kv_cache_spec.storage_block_size,
             )
             cache_handle.residency = residency
             assert cache_handle.view is not None
@@ -262,6 +263,7 @@ def bind_hisparse_kv_caches(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=group.kv_cache_spec.block_size,
                 block_table=block_tables.input_block_tables[group_id],
+                storage_block_size=group.kv_cache_spec.storage_block_size,
             )
             resident = cache_handle.view
             hot = cache_handle.runtime.hot
