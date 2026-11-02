@@ -43,9 +43,13 @@ _MIN_STAGED_PREFILL_KV_ROWS = 256
 
 
 def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
+    if attn_metadata is None:
+        return False
+    # Shared compressed caches expose request-level metadata without a
+    # separate decode count; a uniform single-token batch is all-decode.
+    num_decode_tokens = getattr(attn_metadata, "num_decode_tokens", 0)
     return (
-        attn_metadata is not None
-        and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
+        num_decode_tokens == attn_metadata.num_actual_tokens
         and attn_metadata.max_query_len == 1
         and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
     )
@@ -54,9 +58,14 @@ def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
 def _get_max_swap_rows(vllm_config: VllmConfig) -> int:
     max_query_len = max_decode_query_len(vllm_config)
     scheduler_config = vllm_config.scheduler_config
+    # DeepSeek V4.1 shares one compressed cache across several index groups;
+    # each group resolves its own top-k, so a step consumes several slices.
+    hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    index_groups = getattr(hf_text_config, "index_source_layer_ids", None) or ()
+    group_calls = max(len(index_groups), 1)
     return min(
         scheduler_config.max_num_batched_tokens,
-        scheduler_config.max_num_seqs * max_query_len,
+        scheduler_config.max_num_seqs * max_query_len * group_calls,
     )
 
 
@@ -736,6 +745,8 @@ class HiSparseRuntime:
         index_group: HiSparseIndexGroup | None = None,
         copy_stream: torch.Stream | None = None,
         logical_topk_ready: torch.Event | None = None,
+        storage_block_size: int | None = None,
+        row_value_bytes: int | None = None,
     ) -> None:
         self.backend = get_hisparse_backend()
         self.backend.check_available()
@@ -743,6 +754,8 @@ class HiSparseRuntime:
         self.max_num_reqs = max_num_reqs
         self.row_width = row_width
         self.kv_dtype = kv_dtype
+        self.storage_block_size = storage_block_size
+        self.row_value_bytes = row_value_bytes
         self.device = torch.device(device)
         # Logical slots per request. Physical rows come from its ephemeral HMA
         # block table and need not be contiguous in the shared slab.
@@ -752,9 +765,14 @@ class HiSparseRuntime:
             _check_residency_shared_memory(self.device, config)
 
         row_bytes = row_width * kv_dtype.itemsize
-        if row_bytes % 16 != 0:
+        if row_value_bytes is None and row_bytes % 16 != 0:
             raise ValueError(
                 f"HiSparse requires 16-byte aligned KV rows, got {row_bytes}B."
+            )
+        if row_value_bytes is not None and not 0 < row_value_bytes < row_bytes:
+            raise ValueError(
+                "HiSparse split-page value bytes must be between zero and the "
+                f"full row width, got {row_value_bytes} for a {row_bytes}B row."
             )
 
         self._layer_ready_event: torch.Event | None = None
@@ -804,7 +822,7 @@ class HiSparseRuntime:
             byte_offset=byte_offset,
             block_stride=block_stride,
             num_blocks=num_blocks,
-            block_size=block_size,
+            block_size=self.storage_block_size or block_size,
         )
         self.hot_backing = raw_tensor
         self.hot_block_table = block_table
@@ -835,7 +853,25 @@ class HiSparseRuntime:
         if not (kv_cache.is_pinned() or registered_host_pool is not None):
             raise ValueError("HiSparse host-resident KV pool must be pinned memory.")
 
-        self._host_cache = kv_cache.view(-1, kv_cache.shape[-1])
+        if self.row_value_bytes is not None:
+            host_cache = kv_cache
+            if host_cache.dim() == 4:
+                if host_cache.shape[1] == 1:
+                    host_cache = host_cache.squeeze(1)
+                elif host_cache.shape[2] == 1:
+                    host_cache = host_cache.squeeze(2)
+                else:
+                    raise ValueError(
+                        "HiSparse split-page host cache must have one KV head."
+                    )
+            if host_cache.dim() != 3:
+                raise ValueError(
+                    "HiSparse split-page host cache must be a 3D paged cache, "
+                    f"got {host_cache.dim()}D."
+                )
+            self._host_cache = host_cache
+        else:
+            self._host_cache = kv_cache.view(-1, kv_cache.shape[-1])
         self.registered_host_pool = (
             registered_host_pool if registered_host_pool is not None else kv_cache
         )
@@ -866,8 +902,13 @@ class HiSparseRuntime:
             self.backend.gather_resident_rows(
                 resident_cache, staged.view(-1, row_width), plan.gpu_row_ids[0]
             )
+        host_cache = (
+            kv_cache
+            if self.row_value_bytes is not None
+            else kv_cache.view(-1, row_width)
+        )
         self.cache_ops.hisparse_gather_plan(
-            kv_cache.view(-1, row_width),
+            host_cache,
             staged,
             plan.row_ids,
             plan.dst_rows,
@@ -875,6 +916,7 @@ class HiSparseRuntime:
             None,
             None,
             0,
+            self.row_value_bytes or 0,
         )
         return staged
 
@@ -886,6 +928,19 @@ class HiSparseRuntime:
         group.device_global_indices.fill_(-1)
         group.lru_slots.copy_(group.lru_init.expand_as(group.lru_slots))
         group.swap_stats.zero_()
+        group.copy_stream.wait_stream(compute_stream)
+
+    def reset_hot_rows(self, state_rows: torch.Tensor) -> None:
+        """Drop hot bookkeeping for state rows that switched to a new request."""
+        if state_rows.numel() == 0:
+            return
+        group = self.index_group
+        compute_stream = torch.accelerator.current_stream()
+        compute_stream.wait_stream(group.copy_stream)
+        group.device_global_indices.index_fill_(0, state_rows, -1)
+        group.lru_slots.index_copy_(
+            0, state_rows, group.lru_init.expand(state_rows.numel(), -1)
+        )
         group.copy_stream.wait_stream(compute_stream)
 
     def invalidate_sorted_slots(
@@ -1008,6 +1063,7 @@ class HiSparseRuntime:
             if resident is not None and resident.view is not None
             else 0,
             0,
+            self.row_value_bytes or 0,
         )
 
     def _swap_rows(self, shared_rows: slice) -> None:
@@ -1019,6 +1075,7 @@ class HiSparseRuntime:
             shared.swap_host_physical_rows[shared_rows],
             shared.swap_device_physical_rows[shared_rows],
             shared.swap_counts[shared_rows],
+            self.row_value_bytes or 0,
         )
 
     def _resolve_and_stage_group(
@@ -1209,14 +1266,20 @@ class HiSparseCacheHandle:
             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
         )
         self.num_decode_tokens = (
-            attn_metadata.num_decode_tokens if attn_metadata is not None else 0
+            getattr(attn_metadata, "num_decode_tokens", 0)
+            if attn_metadata is not None
+            else 0
         )
         self.req_id_per_token = (
             attn_metadata.req_id_per_token if attn_metadata is not None else None
         )
         self.decode_batch = is_hisparse_decode_batch(attn_metadata)
-        self.host_mirror_required = attn_metadata is not None and (
-            not self.decode_batch or self.runtime.eager_host_mirror
+        # Split-page caches are written straight to the host pool, so the
+        # per-layer device mirror is neither needed nor valid for them.
+        self.host_mirror_required = (
+            attn_metadata is not None
+            and self.runtime.row_value_bytes is None
+            and (not self.decode_batch or self.runtime.eager_host_mirror)
         )
 
     def write_target(
@@ -1256,7 +1319,7 @@ class HiSparseCacheHandle:
             byte_offset=byte_offset,
             block_stride=block_stride,
             num_blocks=num_blocks,
-            block_size=block_size,
+            block_size=self.runtime.storage_block_size or block_size,
         )
         self.block_table = block_table
         self.slot_mapping = slot_mapping
@@ -1312,6 +1375,8 @@ def create_hisparse_cache_handle(
     kv_dtype: torch.dtype,
     index_group: HiSparseMLAIndexGroup | None = None,
     device: torch.device | str | None = None,
+    storage_block_size: int | None = None,
+    row_value_bytes: int | None = None,
 ) -> HiSparseCacheHandle | None:
     config = ResolvedHiSparseConfig.from_vllm_config(vllm_config, model_top_k)
     if config is None:
@@ -1343,6 +1408,8 @@ def create_hisparse_cache_handle(
             if index_group is not None and index_group.has_indexer
             else None
         ),
+        storage_block_size=storage_block_size,
+        row_value_bytes=row_value_bytes,
     )
     if is_index_group_leader and index_group is not None:
         index_group.hisparse_group = runtime.index_group
