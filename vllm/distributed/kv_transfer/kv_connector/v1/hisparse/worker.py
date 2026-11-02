@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -370,6 +371,8 @@ class HiSparseConnectorWorker:
             return
         # Attention indexes persistent request state by input-batch row. Refresh
         # that indirection after every batch compaction or reorder.
+        if os.environ.get("VLLM_HISPARSE_DEBUG"):
+            print("HISPARSE_SET_STATE", indices[:8].tolist(), flush=True)
         self.request_state_indices.fill_(-1)
         self.request_state_indices[: indices.numel()].copy_(indices)
         if self._pending_invalid_block_ids:
@@ -440,6 +443,14 @@ class HiSparseConnectorWorker:
         request_ids: list[str] | None = None,
         num_tokens: int = 0,
     ) -> None:
+        if os.environ.get("VLLM_HISPARSE_DEBUG"):
+            print(
+                "HISPARSE_START_STEP",
+                "none_state", request_state_indices is None,
+                "req_ids", None if request_ids is None else request_ids[:2],
+                "tokens", num_tokens,
+                flush=True,
+            )
         self._stage_row_mirror_mapping(num_tokens)
         self._finish_previous_step()
         previous_host_write_event = self.host_write_event
