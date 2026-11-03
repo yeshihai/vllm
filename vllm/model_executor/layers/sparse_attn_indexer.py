@@ -649,7 +649,10 @@ def sparse_attn_indexer(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            max(c.max_local_total_seq_lens for c in prefill_metadata.chunks),
+            head_dim,
+            fp8_dtype,
+            use_fp4_cache,
         )
         # PCP + DCP needs two more pairs: the rank-major all-gather destination
         # and the de-interleaved result.
