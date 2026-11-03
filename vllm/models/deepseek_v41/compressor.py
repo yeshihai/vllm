@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     max_decode_query_len,
 )
+from vllm.v1.hisparse.layout import HISPARSE_RESIDENT_SUFFIX
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 
 
@@ -271,6 +272,25 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         return CompressorBackend
 
 
+def _resident_slot_mapping(
+    k_cache_layer: Any, k_cache_prefix: str
+) -> torch.Tensor | None:
+    """Resident slots for the rows the current forward writes.
+
+    The forward context's per-layer mapping follows the batch actually run.
+    SWA bounded replay runs the replay layers on a gathered sub-batch, where
+    the handle's stored mapping (the whole batch) would mirror the replayed
+    rows into another request's slots.
+    """
+    by_layer = get_forward_context().slot_mapping
+    if isinstance(by_layer, dict):
+        resident_slots = by_layer.get(f"{k_cache_prefix}{HISPARSE_RESIDENT_SUFFIX}")
+        if resident_slots is not None:
+            return resident_slots
+    hisparse_cache = k_cache_layer.hisparse_cache
+    return hisparse_cache.slot_mapping if hisparse_cache is not None else None
+
+
 class DeepseekCompressor(nn.Module):
     """DeepSeek V4.1 KV/score compressor.
 
@@ -451,7 +471,7 @@ class DeepseekCompressor(nn.Module):
             # rows. Mirror the row the host write just produced into the
             # resident slot so both copies agree.
             resident = hisparse_cache.view
-            resident_slots = hisparse_cache.slot_mapping
+            resident_slots = _resident_slot_mapping(k_cache_layer, self.k_cache_prefix)
             if resident is not None and resident_slots is not None:
                 num_tokens = min(
                     k_cache_metadata.slot_mapping.numel(), resident_slots.numel()
