@@ -2,13 +2,15 @@
 
 Status: experimental
 
-## DeepSeek V4.1 prefix-caching limitation
+## DeepSeek V4.1 prefix caching and SWA bounded replay
 
-The DeepSeek V4.1 host-backed compressed caches (the C1 and C2 source layers)
-do not support prefix caching yet: a prefix-cache hit can reuse source rows
-with stale residency state and corrupt the output. Enable HiSparse V4.1 with
-`--no-enable-prefix-caching` until the prefix-hit residency path is fixed; the
-layout rejects the combination at startup.
+The DeepSeek V4.1 compressed source caches take part in prefix caching like
+any other cache group: a hit adopts the published host blocks, and the
+scheduler replays the sliding window at the end of the hit
+(`swa_bounded_replay`) so the replayed tokens rebuild their window KV
+without rewriting the cached compressed rows. The replay layers run on a
+gathered sub-batch; the compressor's resident mirror follows that
+sub-batch's slot mapping, not the whole forward batch's.
 
 ## The short version
 
