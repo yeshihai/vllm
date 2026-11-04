@@ -69,7 +69,29 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _LAB_DUMP_STATE = {"count": 0}
 
 
-def _lab_maybe_dump_logical(logical_indices, layer, rows):
+def _lab_row_positions(attn_metadata, num_tokens):
+    """Absolute query positions for the lab, from req ids and seq_lens."""
+    sl = getattr(attn_metadata, "seq_lens", None)
+    rids = getattr(attn_metadata, "req_id_per_token", None)
+    if sl is None or rids is None:
+        return None
+    rid = rids[:num_tokens].to("cpu").tolist()
+    if len(rid) != num_tokens:
+        return None
+    slv = sl.to("cpu").tolist()
+    from collections import Counter
+
+    cnt = Counter(rid)
+    starts = {r: slv[r] - cnt[r] for r in cnt}
+    seen = Counter()
+    out = []
+    for r in rid:
+        out.append(starts[r] + seen[r])
+        seen[r] += 1
+    return out
+
+
+def _lab_maybe_dump_logical(logical_indices, layer, rows, row_positions=None):
     """Dump indexer-selected logical token positions (env gated)."""
     dump_dir = os.environ.get("FP8LAB_DUMP_DIR")
     if not dump_dir or os.environ.get("FP8LAB_DUMP_LOGICAL", "0") != "1":
@@ -99,7 +121,29 @@ def _lab_maybe_dump_logical(logical_indices, layer, rows):
     tag = _lc[layer_name]
     with torch.no_grad():
         os.makedirs(dump_dir, exist_ok=True)
-        if os.environ.get("FP8LAB_DUMP_LAST", "0") == "1":
+        stride_env = os.environ.get("FP8LAB_DUMP_POS_STRIDE", "0")
+        positions = None
+        start = None
+        if stride_env not in ("", "0"):
+            stride = int(stride_env)
+            valid = logical_indices >= 0
+            if not bool(valid.any()):
+                return
+            if row_positions is not None and len(row_positions) == rows:
+                pos_all = torch.tensor(row_positions, dtype=torch.int64)
+                start = int(pos_all[0].item()) if pos_all.numel() else 0
+            else:
+                idx_max = int(logical_indices[valid].max())
+                start = idx_max - rows + 1
+                pos_all = torch.arange(
+                    start, start + rows, device=logical_indices.device
+                )
+            mask = (pos_all >= 2048) & (pos_all % stride == 0)
+            ridx = torch.nonzero(mask, as_tuple=False).flatten()
+            if ridx.numel() > 64:
+                ridx = ridx[:: max(1, ridx.numel() // 64)][:64]
+            positions = pos_all[ridx].detach().to("cpu")
+        elif os.environ.get("FP8LAB_DUMP_LAST", "0") == "1":
             ridx = torch.arange(
                 max(0, rows - 64), rows, device=logical_indices.device
             ).long()
@@ -112,6 +156,9 @@ def _lab_maybe_dump_logical(logical_indices, layer, rows):
             "layer": layer_name,
             "tag": str(tag),
         }
+        if positions is not None:
+            payload["positions"] = positions
+            payload["start"] = int(start)
         path = os.path.join(
             dump_dir, "logidx_%s_%s.pt" % (tag, layer_name.replace("/", "_"))
         )
@@ -836,7 +883,13 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
-        _lab_maybe_dump_logical(topk_indices, layer, num_tokens)
+        _lab_row_pos = None
+        if num_tokens >= 1024 and os.environ.get("FP8LAB_DUMP_LOGICAL", "0") == "1":
+            try:
+                _lab_row_pos = _lab_row_positions(attn_metadata, num_tokens)
+            except Exception:
+                _lab_row_pos = None
+        _lab_maybe_dump_logical(topk_indices, layer, num_tokens, _lab_row_pos)
         _lab_raw_kv_cache = kv_c_and_k_pe_cache
         kv_c_and_k_pe_cache, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
