@@ -143,6 +143,9 @@ def _lab_maybe_dump_logical(logical_indices, layer, rows, row_positions=None):
             if ridx.numel() > 64:
                 ridx = ridx[:: max(1, ridx.numel() // 64)][:64]
             positions = pos_all[ridx].detach().to("cpu")
+            from vllm import lab_drift
+
+            lab_drift.set_row_sample_from_name(layer_name, ridx, positions, start, rows)
         elif os.environ.get("FP8LAB_DUMP_LAST", "0") == "1":
             ridx = torch.arange(
                 max(0, rows - 64), rows, device=logical_indices.device

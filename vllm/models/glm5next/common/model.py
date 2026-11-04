@@ -262,6 +262,10 @@ class Glm5NextMoE(nn.Module):
         else:
             self.gate.e_score_correction_bias = None
 
+        from vllm import lab_drift
+
+        lab_drift.maybe_register_gate_hook(self.gate, prefix)
+
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
         self.enable_eplb = parallel_config.enable_eplb
