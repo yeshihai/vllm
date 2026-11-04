@@ -8,6 +8,7 @@ import re
 import torch
 
 _STATE: dict[int, tuple[torch.Tensor, torch.Tensor, int, int]] = {}
+_OUT_STATE: dict[int, tuple[torch.Tensor, torch.Tensor, int, int]] = {}
 _COUNTS: dict[str, int] = {}
 
 
@@ -17,6 +18,10 @@ def _enabled() -> bool:
 
 def _dump_dir() -> str | None:
     return os.environ.get("FP8LAB_DUMP_DIR")
+
+
+def moe_out_enabled() -> bool:
+    return _enabled() and os.environ.get("FP8LAB_DUMP_MOE_OUT", "0") == "1"
 
 
 def _rank_zero() -> bool:
@@ -64,6 +69,60 @@ def maybe_register_gate_hook(gate: torch.nn.Module, prefix: str) -> None:
     gate.register_forward_hook(_hook)
 
 
+def maybe_register_moe_out_hook(module: torch.nn.Module, prefix: str) -> None:
+    if not moe_out_enabled():
+        return
+    m = re.search(r"layers\.(\d+)", prefix)
+    if m is None:
+        return
+    layer_idx = int(m.group(1))
+
+    def _hook(module, inputs, output):
+        _maybe_dump_moe_out(layer_idx, prefix, output)
+
+    module.register_forward_hook(_hook)
+
+
+def _maybe_dump_moe_out(layer_idx, layer_name, output) -> None:
+    if not moe_out_enabled():
+        return
+    dump_dir = _dump_dir()
+    if not dump_dir or not _rank_zero():
+        return
+    if os.environ.get("FP8LAB_DUMP_REQUIRE_MARKER", "0") == "1" and not os.path.exists(
+        os.path.join(dump_dir, "ENABLE")
+    ):
+        return
+    sample = _OUT_STATE.pop(layer_idx, None)
+    if sample is None:
+        return
+    ridx, positions, start, attn_rows = sample
+    out = output[0] if isinstance(output, (tuple, list)) else output
+    if not torch.is_tensor(out) or out.dim() != 2:
+        return
+    if out.shape[0] != attn_rows:
+        return
+    ridx = ridx.to(out.device)
+    if ridx.numel() == 0 or int(ridx.max()) >= out.shape[0]:
+        return
+    sel = out.index_select(0, ridx).detach().to(torch.float32).cpu()
+    tag = _COUNTS.get(layer_name + ".out", 0) + 1
+    _COUNTS[layer_name + ".out"] = tag
+    payload = {
+        "out": sel,
+        "positions": positions,
+        "rows": attn_rows,
+        "start": start,
+        "layer": layer_name,
+        "tag": str(tag),
+    }
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(
+        dump_dir, "moeout_%s_%s.pt" % (tag, layer_name.replace("/", "_"))
+    )
+    torch.save(payload, path)
+
+
 def _maybe_dump_gate(layer_idx, layer_name, output, bias) -> None:
     if not _enabled():
         return
@@ -77,6 +136,8 @@ def _maybe_dump_gate(layer_idx, layer_name, output, bias) -> None:
     sample = _STATE.pop(layer_idx, None)
     if sample is None:
         return
+    if moe_out_enabled():
+        _OUT_STATE[layer_idx] = sample
     ridx, positions, start, attn_rows = sample
     logits = output[0] if isinstance(output, (tuple, list)) else output
     if not torch.is_tensor(logits) or logits.dim() != 2:

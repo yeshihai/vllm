@@ -265,6 +265,7 @@ class Glm5NextMoE(nn.Module):
         from vllm import lab_drift
 
         lab_drift.maybe_register_gate_hook(self.gate, prefix)
+        lab_drift.maybe_register_moe_out_hook(self, prefix)
 
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
