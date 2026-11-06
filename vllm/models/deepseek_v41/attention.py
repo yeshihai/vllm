@@ -616,21 +616,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     "DeepSeek V4.1 HiSparse currently requires the FlashMLA "
                     f"backend; got {type(self).__name__}."
                 )
+            if self.kv_mxfp8:
+                raise NotImplementedError(
+                    "DeepSeek V4.1 HiSparse does not support the SM100 MXFP8 "
+                    "528-byte KV record. HiSparse is currently limited to SM90."
+                )
+            if not current_platform.is_device_capability(90):
+                raise NotImplementedError(
+                    "DeepSeek V4.1 HiSparse is currently supported only on SM90."
+                )
             if self.kv_cache_dtype != "fp8_ds_mla":
                 raise ValueError(
                     "DeepSeek V4.1 HiSparse requires the fp8_ds_mla cache layout."
                 )
-            if self.kv_mxfp8:
-                row_width, row_value_bytes = 528, 512
-            else:
-                row_width, row_value_bytes = 584, 576
             self.hisparse_cache = create_hisparse_cache_handle(
                 vllm_config,
                 vllm_config.model_config.hf_text_config.index_topk,
                 is_index_group_leader=True,
-                row_width=row_width,
+                row_width=584,
                 kv_dtype=torch.uint8,
-                row_value_bytes=row_value_bytes,
+                row_value_bytes=576,
             )
             assert self.hisparse_cache is not None
 

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -79,10 +78,7 @@ def _allocate_dma_descriptors(size: int) -> _DMADescriptors:
     )
 
 
-# The engine logs connector stats every few seconds. Snapshot the device
-# counters on the same timescale so a reporting interval never misses traffic
-# that happened while a 2000-step cadence was still pending.
-_METRICS_FLUSH_SECONDS = 2.0
+_METRICS_INTERVAL = 2000
 
 
 def _get_hisparse_cache(
@@ -276,6 +272,8 @@ class HiSparseConnectorWorker:
         self.pinned_host_pools = pinned_host_pools
         self.shared_host_region = shared_host_region
         self.is_host_writer = is_host_writer
+        for handle in cache_handles:
+            handle.is_host_writer = is_host_writer
         self.dma_stream = torch.Stream(device=device) if self.is_host_writer else None
         self._slot_mapping_staging = None
         if self.is_host_writer:
@@ -347,9 +345,9 @@ class HiSparseConnectorWorker:
         self._pending_transfer_events: deque[tuple[torch.Event, tuple[int, ...]]] = (
             deque()
         )
+        self._metrics_calls = 0
         self._metrics_event = torch.Event()
         self._metrics_pending = False
-        self._metrics_next_flush = time.monotonic() + _METRICS_FLUSH_SECONDS
         self._active_request_ids: set[str] = set()
         self._init_dma()
         if self.is_host_writer:
@@ -364,9 +362,13 @@ class HiSparseConnectorWorker:
     def set_request_state_indices(self, indices: torch.Tensor) -> None:
         # The runtime may rebind its request-state tensor between the
         # profiling and the real KV cache, so never keep a stale alias.
-        runtime_state = self.cache_handles[0].runtime.request_state_indices
-        if runtime_state is not None and runtime_state is not self.request_state_indices:
-            self.request_state_indices = runtime_state
+        if self.cache_handles:
+            runtime_state = self.cache_handles[0].runtime.request_state_indices
+            if (
+                runtime_state is not None
+                and runtime_state is not self.request_state_indices
+            ):
+                self.request_state_indices = runtime_state
         if indices.numel() > self.request_state_indices.numel():
             raise ValueError(
                 "HiSparse request-state mapping exceeds max_num_seqs: "
@@ -438,8 +440,7 @@ class HiSparseConnectorWorker:
                 # whole-page copies stay valid in this paged layout.
                 host_rows_ok = (
                     host_cache.stride(-1) == 1
-                    and host_cache.stride(1) * host_cache.element_size()
-                    == row_bytes
+                    and host_cache.stride(1) * host_cache.element_size() == row_bytes
                 )
             if not host_rows_ok or (
                 host_cache.shape[-1] * host_cache.element_size() != row_bytes
@@ -454,8 +455,8 @@ class HiSparseConnectorWorker:
         num_tokens: int = 0,
     ) -> None:
         self._stage_row_mirror_mapping(num_tokens)
-        self._finish_previous_step()
         previous_host_write_event = self.host_write_event
+        self._finish_previous_step(previous_host_write_event)
         self.host_write_event = self.host_write_events[self._next_host_write_event]
         self._next_host_write_event ^= 1
         torch.accelerator.current_stream().wait_event(previous_host_write_event)
@@ -608,9 +609,9 @@ class HiSparseConnectorWorker:
             if stats.is_empty():
                 stats = None
 
-        now = time.monotonic()
+        self._metrics_calls += 1
         if (
-            now >= self._metrics_next_flush
+            self._metrics_calls % _METRICS_INTERVAL == 0
             and not self._metrics_pending
             and not self.backend.is_current_stream_capturing()
         ):
@@ -623,7 +624,6 @@ class HiSparseConnectorWorker:
                 group.copy_stream.wait_stream(compute_stream)
             self._metrics_event.record()
             self._metrics_pending = True
-            self._metrics_next_flush = now + _METRICS_FLUSH_SECONDS
         return stats
 
     def _release_completed_dma_descriptors(self) -> None:
@@ -778,6 +778,7 @@ class HiSparseConnectorWorker:
         transfers: list[SparseKVPageTransfer],
         *,
         stream: torch.Stream | None = None,
+        ready_event: torch.Event | None = None,
     ) -> None:
         if not transfers:
             return
@@ -786,6 +787,8 @@ class HiSparseConnectorWorker:
                 return
             stream = self.dma_stream
         assert stream is not None
+        if ready_event is not None:
+            stream.wait_event(ready_event)
         completion_event = torch.Event()
         completion_event.record(stream)
         transfer_ids = tuple(transfer.transfer_id for transfer in transfers)
@@ -821,9 +824,13 @@ class HiSparseConnectorWorker:
             transfers, stream=torch.accelerator.current_stream()
         )
 
-    def _submit_transfers(self, transfers: list[SparseKVPageTransfer]) -> None:
+    def _submit_transfers(
+        self,
+        transfers: list[SparseKVPageTransfer],
+        ready_event: torch.Event,
+    ) -> None:
         if self.cache_handles[0].runtime.eager_host_mirror:
-            self._record_transfer_completion(transfers)
+            self._record_transfer_completion(transfers, ready_event=ready_event)
         else:
             self._enqueue_transfers(transfers)
 
@@ -865,9 +872,7 @@ class HiSparseConnectorWorker:
                     )
                 destination_offsets = (
                     destination.data_ptr()
-                    + host_blocks
-                    * destination.stride(0)
-                    * destination.element_size()
+                    + host_blocks * destination.stride(0) * destination.element_size()
                 )
             else:
                 row_starts = host_blocks * page_rows
@@ -976,7 +981,7 @@ class HiSparseConnectorWorker:
                 self.host_write_event.record(compute_stream)
         self._release_completed_dma_descriptors()
 
-    def _finish_previous_step(self) -> None:
+    def _finish_previous_step(self, previous_host_write_event: torch.Event) -> None:
         """Mirror the previous step's draft-layer rows, then hand its pages over.
 
         Runs before this step's work, so after the previous step's drafter.
@@ -992,7 +997,7 @@ class HiSparseConnectorWorker:
             self._enqueue_row_dma(self._draft_layers)
         transfers = self._post_forward_transfers
         self._post_forward_transfers = []
-        self._submit_transfers(transfers)
+        self._submit_transfers(transfers, previous_host_write_event)
 
     def take_completed_host_copies(self) -> list[int]:
         """Drain host copies this worker has enqueued for this step."""

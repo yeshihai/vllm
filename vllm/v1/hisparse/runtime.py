@@ -46,13 +46,10 @@ _MIN_STAGED_PREFILL_KV_ROWS = 256
 
 
 def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
-    if attn_metadata is None:
-        return False
-    # Shared compressed caches expose request-level metadata without a
-    # separate decode count; a uniform single-token batch is all-decode.
-    num_decode_tokens = getattr(attn_metadata, "num_decode_tokens", 0)
     return (
-        num_decode_tokens == attn_metadata.num_actual_tokens
+        attn_metadata is not None
+        and attn_metadata.num_actual_tokens > 0
+        and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
         and attn_metadata.max_query_len == 1
         and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
     )
@@ -72,15 +69,39 @@ def is_hisparse_group_prefetch_batch(attn_metadata: Any | None, max_rows: int) -
 def _get_max_swap_rows(vllm_config: VllmConfig) -> int:
     max_query_len = max_decode_query_len(vllm_config)
     scheduler_config = vllm_config.scheduler_config
-    # DeepSeek V4.1 shares one compressed cache across several index groups;
-    # each group resolves its own top-k, so a step consumes several slices.
-    hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
-    index_groups = getattr(hf_text_config, "index_source_layer_ids", None) or ()
-    group_calls = max(len(index_groups), 1)
-    return min(
+    per_call_cap = min(
         scheduler_config.max_num_batched_tokens,
-        scheduler_config.max_num_seqs * max_query_len * group_calls,
+        scheduler_config.max_num_seqs * max_query_len,
     )
+
+    # V4.1 can reuse one compressed KV source from several independently
+    # resolved index groups. Count only the groups owned by the busiest source.
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    index_sources = getattr(hf_text_config, "index_source_layer_ids", None) or ()
+    kv_sources = getattr(hf_text_config, "kv_source_layer_ids", None) or ()
+    try:
+        index_sources = tuple(sorted({int(layer) for layer in index_sources}))
+    except (TypeError, ValueError):
+        return per_call_cap
+    if not index_sources:
+        return per_call_cap
+    try:
+        kv_sources = tuple(sorted({int(layer) for layer in kv_sources}))
+    except (TypeError, ValueError):
+        return per_call_cap * len(index_sources)
+    if not kv_sources:
+        return per_call_cap * len(index_sources)
+
+    groups_per_kv_source = {layer: 0 for layer in kv_sources}
+    for index_source in index_sources:
+        owners = [layer for layer in kv_sources if layer <= index_source]
+        if not owners:
+            # An incomplete topology is safest when every known index group is
+            # assumed to share one source.
+            return per_call_cap * len(index_sources)
+        groups_per_kv_source[owners[-1]] += 1
+    return per_call_cap * max(groups_per_kv_source.values(), default=1)
 
 
 @dataclass(frozen=True)
@@ -793,6 +814,7 @@ class HiSparseRuntime:
         self.cache_ops: Any = None
         self.host_pool: HiSparseHostPool | None = None
         self.request_state_indices: torch.Tensor | None = None
+        self._written_slot_invalidator: HiSparseSlotInvalidator | None = None
         self.resident_source_index = -1
         self._layer_ready_event: torch.Event | None = None
         self._swap_staged = False
@@ -976,10 +998,14 @@ class HiSparseRuntime:
         req_id_per_token: torch.Tensor,
     ) -> None:
         """Drop hot copies of slots written outside the fused insert path."""
-        invalidator = getattr(self, "_written_slot_invalidator", None)
-        if invalidator is None:
-            assert self.request_state_indices is not None
-            invalidator = HiSparseSlotInvalidator(self.request_state_indices)
+        request_state_indices = self.request_state_indices
+        assert request_state_indices is not None
+        invalidator = self._written_slot_invalidator
+        if (
+            invalidator is None
+            or invalidator.request_state_indices is not request_state_indices
+        ):
+            invalidator = HiSparseSlotInvalidator(request_state_indices)
             self._written_slot_invalidator = invalidator
         invalidator([self], written_slots, req_id_per_token)
 
@@ -1279,6 +1305,8 @@ class HiSparseCacheHandle:
 
     def __init__(self, runtime: HiSparseRuntime) -> None:
         self.runtime = runtime
+        # Shared host pools have one publisher; private pools write per rank.
+        self.is_host_writer = True
         # Speculator layers write their rows after the target forward.
         self.draft_layer = False
         self.index_group_caches: list[HiSparseCacheHandle] = [self]
@@ -1318,9 +1346,7 @@ class HiSparseCacheHandle:
             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
         )
         self.num_decode_tokens = (
-            getattr(attn_metadata, "num_decode_tokens", 0)
-            if attn_metadata is not None
-            else 0
+            attn_metadata.num_decode_tokens if attn_metadata is not None else 0
         )
         self.req_id_per_token = (
             attn_metadata.req_id_per_token if attn_metadata is not None else None
@@ -1481,4 +1507,9 @@ def create_hisparse_cache_handle(
         config.device_buffer_size,
         max_num_reqs,
     )
-    return HiSparseCacheHandle(runtime)
+    handle = HiSparseCacheHandle(runtime)
+    shared_host_pool = getattr(
+        vllm_config, "parallel_config", None
+    ) is not None and use_shared_hisparse_host_pool(vllm_config)
+    handle.is_host_writer = not shared_host_pool or get_tp_group().rank_in_group == 0
+    return handle
