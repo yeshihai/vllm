@@ -462,7 +462,10 @@ class HiSparseConnectorWorker:
             self.cache_handles, resident_caches, host_caches
         ):
             row_bytes = resident_cache.shape[-1] * resident_cache.element_size()
-            page_rows = cache.runtime.storage_block_size or resident_cache.shape[1]
+            page_rows = (
+                getattr(cache.runtime, "storage_block_size", None)
+                or resident_cache.shape[1]
+            )
             if (
                 resident_cache.ndim != 3
                 or resident_cache.shape[1] != page_rows
@@ -622,7 +625,9 @@ class HiSparseConnectorWorker:
         blocks = staging.to(device, dtype=torch.int32, non_blocking=True)
         state_indices = request_state_indices.to(device=device, dtype=torch.long)
         for runtime in self.leader_runtimes:
-            page_rows = runtime.storage_block_size or self.kernel_block_size
+            page_rows = (
+                getattr(runtime, "storage_block_size", None) or self.kernel_block_size
+            )
             offsets = torch.arange(page_rows, dtype=torch.int32, device=device)
             slots = (blocks[:, None] * page_rows + offsets[None, :]).flatten()
             sorted_slots = torch.sort(slots).values
@@ -748,7 +753,10 @@ class HiSparseConnectorWorker:
             source = self.resident_caches[layer_index]
             destination = self.host_caches[layer_index]
             row_bytes = source.shape[-1] * source.element_size()
-            page_rows = cache.runtime.storage_block_size or self.kernel_block_size
+            page_rows = (
+                getattr(cache.runtime, "storage_block_size", None)
+                or self.kernel_block_size
+            )
             source_blocks, source_row_offsets = np.divmod(source_rows, page_rows)
             source_out_of_range = (
                 np.any(source_blocks < 0)
@@ -838,7 +846,10 @@ class HiSparseConnectorWorker:
             source_index = cache.runtime.resident_source_index
             source = self.host_caches[layer_index]
             destination = self.resident_caches[layer_index]
-            page_rows = cache.runtime.storage_block_size or self.kernel_block_size
+            page_rows = (
+                getattr(cache.runtime, "storage_block_size", None)
+                or self.kernel_block_size
+            )
             for transfer in transfers:
                 resident_block = transfer.resident_block_ids[source_index]
                 # Each import pays one H2D page copy and enqueue per layer/rank
@@ -891,7 +902,10 @@ class HiSparseConnectorWorker:
             source_index = cache.runtime.resident_source_index
             if source_index >= source_blocks_by_transfer.shape[1]:
                 raise RuntimeError("HiSparse spill DMA source index is out of range.")
-            page_rows = cache.runtime.storage_block_size or self.kernel_block_size
+            page_rows = (
+                getattr(cache.runtime, "storage_block_size", None)
+                or self.kernel_block_size
+            )
             source_blocks = source_blocks_by_transfer[:, source_index]
             source = self.resident_caches[layer_index]
             destination = self.host_caches[layer_index]
