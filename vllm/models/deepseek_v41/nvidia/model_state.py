@@ -23,7 +23,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import HiSparseResidentSpec, KVCacheConfig
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -347,7 +347,12 @@ class DeepseekV41ModelState(DefaultModelState):
             self._replay = (
                 max(spec.prefix_replay_tokens for spec in specs),
                 torch.tensor(
-                    [i for i, spec in enumerate(specs) if spec.prefix_cacheable],
+                    [
+                        i
+                        for i, spec in enumerate(specs)
+                        if spec.prefix_cacheable
+                        or isinstance(spec, HiSparseResidentSpec)
+                    ],
                     dtype=torch.int32,
                     device=self.device,
                 ),
