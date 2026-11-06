@@ -76,18 +76,54 @@ class DSV41ShardQ:
         return replay_start.index_select(0, self.run_req)
 
 
-def _replay_batch_guard(
-    cm: CommonAttentionMetadata, vllm_config: "VllmConfig"  # noqa: F821
+def _split_runs(
+    token_ids: np.ndarray,
+    num_decode_tokens: int,
+    query_start_loc: np.ndarray,
+    seq_lens: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Materialize one rank's contiguous request runs from a complete split."""
+    tokens = token_ids + num_decode_tokens
+    req = np.searchsorted(query_start_loc[1:], tokens, side="right")
+    boundary = np.ones(tokens.size, dtype=bool)
+    boundary[1:] = (tokens[1:] != tokens[:-1] + 1) | (req[1:] != req[:-1])
+    starts = np.flatnonzero(boundary)
+    ends = np.r_[starts[1:], tokens.size]
+    run_qlen = (ends - starts).astype(np.int32)
+    run_req = req[starts]
+    run_last = tokens[ends - 1]
+    run_seq = (seq_lens[run_req] - query_start_loc[run_req + 1] + run_last + 1).astype(
+        np.int32
+    )
+    return tokens, starts, run_qlen, run_req, run_seq
+
+
+def dsv41_shardq_eligible(
+    cm: CommonAttentionMetadata,
+    vllm_config: "VllmConfig",  # noqa: F821
+    split: ShardQSplit,
 ) -> bool:
-    # The SWA bounded-replay batch holds at most ``sliding_window`` rows per
-    # request, so its longest query is no longer than the window.  Its
-    # candidate-source/consumer indexers must keep batch-order rows (the
-    # candidate buffer is row-addressable and ShardQ compacts rows), so the
-    # replay batch never takes the sharded path.
-    window = vllm_config.model_config.hf_config.sliding_window
-    if window is None or window <= 0:
-        return False
-    return cm.max_query_len <= window
+    """Whether every TP rank's V4.1 runs remain prefill requests.
+
+    The decision scans the complete split so every rank takes the same path,
+    including when uneven zigzag chunks give only one rank a short run.
+    """
+    query_start_loc = cm.query_start_loc_cpu.numpy()
+    seq_lens = cm.seq_lens_cpu_upper_bound
+    assert seq_lens is not None
+    seq_lens_np = seq_lens.numpy()
+    decode_threshold = max_decode_query_len(vllm_config)
+    rank_offsets = np.r_[0, np.cumsum(split.num_tokens_per_rank)]
+    for start, end in zip(rank_offsets[:-1], rank_offsets[1:]):
+        _, _, run_qlen, _, run_seq = _split_runs(
+            split.token_ids[start:end],
+            split.num_decode_tokens,
+            query_start_loc,
+            seq_lens_np,
+        )
+        if int(run_qlen.min()) <= decode_threshold or int(run_seq.min()) <= 0:
+            return False
+    return True
 
 
 def build_dsv41_shardq(
@@ -114,44 +150,22 @@ def _build_dsv41_shardq(
     vllm_config: "VllmConfig",  # noqa: F821
     device: torch.device,
 ) -> DSV41ShardQ | None:
-    split = build_shardq_split(cm, vllm_config)
+    split = build_shardq_split(cm, vllm_config, eligibility=dsv41_shardq_eligible)
     if split is None:
         return None
     num_decode_tokens = split.num_decode_tokens
-    local = split.local_token_ids + num_decode_tokens
-    if local.size == 0 or _replay_batch_guard(cm, vllm_config):
-        return None
+    query_start_loc = cm.query_start_loc_cpu.numpy()
+    seq_lens = cm.seq_lens_cpu_upper_bound
+    assert seq_lens is not None
+    local, starts, run_qlen, run_req, run_seq = _split_runs(
+        split.local_token_ids,
+        num_decode_tokens,
+        query_start_loc,
+        seq_lens.numpy(),
+    )
 
-    qsl_cpu = cm.query_start_loc_cpu.numpy()
-    seq_cpu = cm.seq_lens_cpu_upper_bound
-    assert seq_cpu is not None
-    seq_cpu = seq_cpu.numpy()
-
-    # Request index of each local token.  The batch is request-major, so
-    # searchsorted over the cumulative query starts is exact.
-    req = np.searchsorted(qsl_cpu[1:], local, side="right")
-
-    # Split the ascending token list into contiguous runs of one request.  A
-    # zigzag slice yields at most two runs per request.
-    boundary = np.ones(local.size, dtype=bool)
-    boundary[1:] = (local[1:] != local[:-1] + 1) | (req[1:] != req[:-1])
-    starts = np.flatnonzero(boundary)
-    ends = np.r_[starts[1:], local.size]
-    run_qlen = (ends - starts).astype(np.int32)
-    run_req = req[starts]
-    run_last = local[ends - 1]
-
-    # A run is a prefill chunk ending at its last token.  ``seq_lens`` is the
-    # uncompressed context length there, which the builders compress
-    # themselves.  The builders reclassify a request of at most
-    # ``max_decode_query_len`` tokens as a decode, while every run of this
-    # batch is a prefill, so such a split stays head-sharded.
-    if int(run_qlen.min()) <= max_decode_query_len(vllm_config):
-        return None
-    run_seq = (seq_cpu[run_req] - qsl_cpu[run_req + 1] + run_last + 1).astype(np.int32)
-    if int(run_seq.max()) <= 0:
-        return None
-
+    # Eligibility was decided from every rank above.  From here on the local
+    # token ids only materialize this rank's metadata.
     run_qsl_cpu = np.zeros(starts.size + 1, dtype=np.int32)
     np.cumsum(run_qlen, out=run_qsl_cpu[1:])
     run_req_gpu = async_tensor_h2d(run_req.astype(np.int32), device=device)
@@ -177,8 +191,7 @@ def _build_dsv41_shardq(
         req_idx=run_req.astype(np.int32),
     )
     logger.info_once(
-        "DeepSeek-V4.1 ShardQ prefill: %d requests, %d local tokens on this "
-        "rank.",
+        "DeepSeek-V4.1 ShardQ prefill: %d requests, %d local tokens on this rank.",
         cm.num_reqs,
         local.size,
     )

@@ -93,6 +93,33 @@ def test_build_shardq_split_after_indexer_decodes(monkeypatch, num_spec):
     assert build_shardq_split(short, vllm_config) is None
 
 
+def test_build_shardq_split_model_eligibility(monkeypatch):
+    monkeypatch.setattr(
+        shardq, "get_tp_group", lambda: SimpleNamespace(world_size=4, rank_in_group=0)
+    )
+    metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[4096], query_lens=[4096]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        attention_config=SimpleNamespace(sparse_mla_shard_q_min_tokens=4096),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=512)),
+    )
+    seen = []
+
+    def eligibility(common, config, split):
+        seen.append(split)
+        assert common is metadata
+        assert config is vllm_config
+        assert split.num_tokens_per_rank.tolist() == [1024] * 4
+        return False
+
+    assert build_shardq_split(metadata, vllm_config, eligibility=eligibility) is None
+    assert len(seen) == 1
+
+
 def _round_trip(rank, world, port, use_sm, q_dtype, num_decode_tokens):
     torch.accelerator.set_device_index(rank)
     vllm_config = VllmConfig()

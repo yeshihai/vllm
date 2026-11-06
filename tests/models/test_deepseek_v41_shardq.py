@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
 from vllm.models.deepseek_v41 import shardq as dsv41_shardq
+from vllm.models.deepseek_v41.attention import DeepseekV4IndexerCache
+from vllm.v1.attention.backends.mla.indexer import _resolve_shardq_eligibility
 from vllm.v1.attention.ops import shardq
 
 WORLD = 4
@@ -90,10 +93,13 @@ def test_decode_prefix_stays_head_sharded():
     assert plan.sharded_cm.query_start_loc.tolist() == [0, 512, 1024]
 
 
-def test_replay_shaped_batch_stays_head_sharded():
-    """The bounded-replay batch (<= window rows per request) is never split."""
+def test_window_sized_prefill_chunks_can_shard():
+    """Query length alone cannot distinguish ordinary chunks from replay."""
     cm = _metadata([2048] * 8, [128] * 8)
-    assert dsv41_shardq.build_dsv41_shardq(cm, _config(), CPU) is None
+    plan = dsv41_shardq.build_dsv41_shardq(cm, _config(), CPU)
+    assert plan is not None
+    assert plan.sharded_cm.num_reqs == 16
+    assert plan.sharded_cm.num_actual_tokens == 256
 
 
 def test_short_batch_stays_head_sharded():
@@ -117,3 +123,46 @@ def test_spec_decode_sized_run_stays_head_sharded():
     cm = _metadata([16], [16])
     config = _config(min_tokens=16, topk=1, num_spec=1)
     assert dsv41_shardq.build_dsv41_shardq(cm, config, CPU) is None
+
+
+def test_uneven_runs_are_rejected_consistently_on_every_rank(monkeypatch):
+    """One rank's wide middle run cannot hide another rank's short runs."""
+    config = _config(min_tokens=16, topk=1, num_spec=2)
+    results = []
+    for rank in range(WORLD):
+        monkeypatch.setattr(
+            shardq,
+            "get_tp_group",
+            lambda rank=rank: SimpleNamespace(world_size=WORLD, rank_in_group=rank),
+        )
+        # Rank 3 owns the adjacent middle chunks as one four-token run, but
+        # ranks 0-2 each have two-token runs, below the decode threshold 3.
+        results.append(
+            dsv41_shardq.build_dsv41_shardq(_metadata([16], [16]), config, CPU)
+        )
+    assert results == [None] * WORLD
+
+
+def test_indexer_resolves_dsv41_shardq_hook_from_static_layers():
+    vllm_config = VllmConfig(cache_config=CacheConfig())
+    with set_current_vllm_config(vllm_config):
+        first = DeepseekV4IndexerCache(
+            head_dim=132,
+            dtype=torch.uint8,
+            prefix="first.indexer.k_cache",
+            cache_config=vllm_config.cache_config,
+        )
+        second = DeepseekV4IndexerCache(
+            head_dim=132,
+            dtype=torch.uint8,
+            prefix="second.indexer.k_cache",
+            cache_config=vllm_config.cache_config,
+        )
+    first.use_shardq = True
+    second.use_shardq = True
+
+    hook = _resolve_shardq_eligibility(
+        {"second": second, "unrelated": torch.nn.Identity(), "first": first},
+        ["second", "first"],
+    )
+    assert hook is dsv41_shardq.dsv41_shardq_eligible

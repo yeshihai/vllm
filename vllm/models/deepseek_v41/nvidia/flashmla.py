@@ -84,6 +84,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
         register_dsv41_o_proj_warmup(self)
         self._prefill_num_heads = self._get_prefill_num_heads()
+        self._shardq_workspace_allocated = False
         self._init_shardq()
 
     def _get_prefill_num_heads(self) -> int:
@@ -124,7 +125,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             max(kv_source_layers) if kv_source_layers else config.num_hidden_layers
         )
         self.use_shardq = (
-            current_platform.is_cuda()
+            current_platform.is_device_capability_family(90)
             and attention_config.sparse_mla_shard_q
             and attention_config.hisparse_config is None
             and parallel_config.tensor_parallel_size > 1
@@ -138,16 +139,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             and not self.accepts_unnormed_unroped_query
             and is_quantized_kv_cache(self.kv_cache_dtype)
         )
-        if self.use_shardq:
-            allocate_shardq_buffers(
-                vllm_config,
-                self.n_local_heads,
-                self.head_dim,
-                self.head_dim,
-                vllm_config.model_config.dtype,
-                vllm_config.model_config.dtype,
-            )
         self.set_shardq_enabled(self.use_shardq)
+
+    def allocate_shardq_workspace(self) -> None:
+        """Allocate this model's shared ShardQ workspace at most once."""
+        if not self.use_shardq or self._shardq_workspace_allocated:
+            return
+        allocate_shardq_buffers(
+            self.vllm_config,
+            self.n_local_heads,
+            self.head_dim,
+            self.head_dim,
+            self.vllm_config.model_config.dtype,
+            self.vllm_config.model_config.dtype,
+        )
+        self._shardq_workspace_allocated = True
 
     def set_shardq_enabled(self, enabled: bool) -> None:
         """Enable/disable the token-sharded prefill path for this layer.
@@ -173,9 +179,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         indexer_op = getattr(indexer, "indexer_op", None)
         if indexer_op is not None:
             indexer_op.k_cache.use_shardq = enabled
-            context_cache = self._static_forward_context.get(
-                indexer_op.k_cache.prefix
-            )
+            context_cache = self._static_forward_context.get(indexer_op.k_cache.prefix)
             if context_cache is not None:
                 context_cache.use_shardq = enabled
 

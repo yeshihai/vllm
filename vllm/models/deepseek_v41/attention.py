@@ -70,6 +70,7 @@ from vllm.models.deepseek_v4.common.grouped_wo_a import DeepseekV4GroupedWoA
 from vllm.models.deepseek_v41.common.ops.fused_layout import Q_CHUNK
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
+from vllm.models.deepseek_v41.shardq import dsv41_shardq_eligible
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
@@ -1158,9 +1159,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return None
         swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
         shardq = (
-            getattr(swa_metadata, "shardq", None)
-            if swa_metadata is not None
-            else None
+            getattr(swa_metadata, "shardq", None) if swa_metadata is not None else None
         )
         compressed = None
         if self.compressed_cache_prefix is not None:
@@ -1382,6 +1381,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
+    shardq_eligibility = staticmethod(dsv41_shardq_eligible)
+
     def __init__(
         self,
         head_dim: int,

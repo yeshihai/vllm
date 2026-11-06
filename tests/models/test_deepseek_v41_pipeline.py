@@ -68,3 +68,40 @@ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
     mhc_residual, mhc_pre_mix = mhc_pre_calls[0]
     torch.testing.assert_close(mhc_residual, hidden + 10)
     assert mhc_pre_mix is pre_mix
+
+
+class _ShardQAttention:
+    def __init__(self, candidate: bool) -> None:
+        self.use_shardq = candidate
+        self.workspace_allocations = 0
+
+    def set_shardq_enabled(self, enabled: bool) -> None:
+        self.use_shardq = enabled
+
+    def allocate_shardq_workspace(self) -> None:
+        self.workspace_allocations += 1
+
+
+class _ShardQLayer:
+    def __init__(self, candidate: bool) -> None:
+        self.attn = _ShardQAttention(candidate)
+
+
+def test_disabled_shardq_does_not_allocate_workspace():
+    model_module = import_module("vllm.models.deepseek_v41.nvidia.model")
+    layers = [_ShardQLayer(True), _ShardQLayer(True)]
+
+    model_module._finalize_shardq(layers, enabled=False)
+
+    assert not any(layer.attn.use_shardq for layer in layers)
+    assert sum(layer.attn.workspace_allocations for layer in layers) == 0
+
+
+def test_enabled_shardq_allocates_workspace_once():
+    model_module = import_module("vllm.models.deepseek_v41.nvidia.model")
+    layers = [_ShardQLayer(False), _ShardQLayer(True), _ShardQLayer(True)]
+
+    model_module._finalize_shardq(layers, enabled=True)
+
+    assert [layer.attn.use_shardq for layer in layers] == [False, True, True]
+    assert [layer.attn.workspace_allocations for layer in layers] == [0, 1, 0]
