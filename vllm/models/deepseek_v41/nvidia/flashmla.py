@@ -377,7 +377,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 # reuse its columns while the span still holds this source and
                 # chunk, and rewrite only their SWA columns.
                 kv, intact = workspace_manager.get_retained(
-                    (self.compressed_cache_prefix, chunk_start, chunk_end),
+                    (
+                        self.compressed_cache_prefix,
+                        (chunk_start, chunk_end, chunk_N, chunk_M),
+                    ),
                     *kv_spec,
                 )
                 if self.is_kv_source or not intact:
@@ -386,8 +389,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     dequantize_and_gather_k_cache(
                         kv[:chunk_size],
                         compressed_k_cache,
-                        seq_lens=seq_lens[chunk_start:chunk_end]
-                        // self.compress_ratio,
+                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
                         gather_lens=None,
                         block_table=block_table[chunk_start:chunk_end],
                         block_size=attn_metadata.block_size // self.compress_ratio,

@@ -447,6 +447,7 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
+        hisparse_cache = getattr(k_cache_layer, "hisparse_cache", None)
         # Plain-row per-tensor fp8 caches (FlashInfer) carry the layer's scale;
         # fp8_ds_mla and bf16 rows need none.
         fp8_scale = (
@@ -455,21 +456,20 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        rope_quant_insert(
-            latent,
-            positions,
-            rotary_emb.cos_sin_cache,
-            kv_cache,
-            k_cache_metadata.slot_mapping,
-            self.compress_ratio,
-            fp8_scale=fp8_scale,
-        )
-        hisparse_cache = k_cache_layer.hisparse_cache
+        if hisparse_cache is None or hisparse_cache.is_host_writer:
+            rope_quant_insert(
+                latent,
+                positions,
+                rotary_emb.cos_sin_cache,
+                kv_cache,
+                k_cache_metadata.slot_mapping,
+                self.compress_ratio,
+                fp8_scale=fp8_scale,
+            )
         if hisparse_cache is not None:
-            # The source pool is host-resident, but the scheduler also promotes
-            # pages into the GPU resident cache and the decoder prefers those
-            # rows. Mirror the row the host write just produced into the
-            # resident slot so both copies agree.
+            # The scheduler also promotes host pages into the rank-local GPU
+            # resident cache, and the decoder prefers those rows. Every rank
+            # writes its resident slot even when only rank 0 owns the host write.
             resident = hisparse_cache.view
             resident_slots = _resident_slot_mapping(k_cache_layer, self.k_cache_prefix)
             if resident is not None and resident_slots is not None:
@@ -481,16 +481,14 @@ class DeepseekCompressor(nn.Module):
                     # Resident slots are per-token rows of the logical block;
                     # the compressed cache stores ratio tokens per state.
                     logical = (
-                        hisparse_cache.runtime.logical_block_size
-                        or self.block_size
+                        hisparse_cache.runtime.logical_block_size or self.block_size
                     )
                     storage = resident.block_size
-                    boundary = (
-                        positions[:num_tokens] + 1
-                    ) % self.compress_ratio == 0
-                    compressed = slots // logical * storage + (
-                        slots % logical
-                    ) // self.compress_ratio
+                    boundary = (positions[:num_tokens] + 1) % self.compress_ratio == 0
+                    compressed = (
+                        slots // logical * storage
+                        + (slots % logical) // self.compress_ratio
+                    )
                     slots = torch.where(
                         (slots >= 0) & boundary,
                         compressed,

@@ -106,16 +106,8 @@ def _partition_hisparse_specs(
         if isinstance(spec, MLAAttentionSpec)
     }
     if "deepseek_v4" in model_versions:
-        specs = {
-            name: spec
-            for name, spec in all_specs.items()
-            if isinstance(spec, MLAAttentionSpec) and spec.tokens_per_state == 4
-        }
-        if not specs:
-            raise ValueError(
-                "HiSparse requires DeepSeek V4 to expose C4 MLA cache layers."
-            )
-    elif "deepseek_v41" in model_versions:
+        raise ValueError("HiSparse does not support DeepSeek V4.")
+    if "deepseek_v41" in model_versions:
         # Both compressed caches are sparse top-k retrievals: C1 (one state per
         # token) and C2 (one state per two tokens) can share the host-backed
         # path. Keep every MLA spec so both source and indexer groups are laid
@@ -197,9 +189,7 @@ def _lay_out_hisparse_groups(
         is_eagle_group=groups[0].is_eagle_group,
     )
     remaining_specs = {
-        name: spec
-        for name, spec in remaining_specs.items()
-        if name not in merged_specs
+        name: spec for name, spec in remaining_specs.items() if name not in merged_specs
     }
 
     indexer_page = sum(spec.page_size_bytes for spec in indexer_specs.values())
@@ -229,9 +219,7 @@ def _lay_out_hisparse_groups(
         # The hot cache holds one row per compressed state, so a ratio-r
         # source packs r states per logical token block.
         storage_block_size = gpu_block_size // ratios.pop()
-        hot_blocks_per_request = cdiv(
-            config.device_buffer_size, storage_block_size
-        )
+        hot_blocks_per_request = cdiv(config.device_buffer_size, storage_block_size)
         names = [name for name, _ in layers]
         resident_groups.append(
             KVCacheGroupSpec(
