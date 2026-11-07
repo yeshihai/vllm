@@ -236,11 +236,17 @@ def _check_residency_shared_memory(
 ) -> None:
     """Reject a config whose residency resolver exceeds per-block shared memory."""
     # Minimum resolver layout: union hash keys and values (plus an empty slot),
-    # per-chunk offsets, five counters, done bits, and the int16 compacted LRU.
-    # The kernel uses remaining shared memory to lower the hash-table load.
+    # per-chunk offsets, per-row valid counts, five counters, done bits, and
+    # the int16 compacted LRU. The kernel uses remaining shared memory to
+    # lower the hash-table load.
     hot_size = config.device_buffer_size
     num_chunks = cdiv(hot_size, 32)
-    required = 4 * (2 * (config.max_union_rows + 1) + 3 * num_chunks + 7) + 2 * hot_size
+    max_request_rows = cdiv(config.max_union_rows, config.top_k)
+    required = (
+        4 * (2 * (config.max_union_rows + 1) + 3 * num_chunks + 7)
+        + 2 * hot_size
+        + 4 * max_request_rows
+    )
     device_index = (
         device.index
         if device.index is not None

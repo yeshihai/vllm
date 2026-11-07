@@ -375,6 +375,7 @@ __device__ __forceinline__ void write_entry_index(
 //                            per-entry hits
 //   s_done[nbc]              hot slots holding a union row (phase 2), then
 //                            positions phase 3 resolved, one word per chunk
+//   s_row_valid[max_rows]    per-row valid counts in phase 1
 //   s_lru_out[hot_size]      int16, compacted slots: [hits fwd | evict bwd]
 // Valid global ids must be unique within each row. A nonzero kBlockSize fixes
 // every block size at compile time.
@@ -415,6 +416,7 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
       kBlockSize > 0 ? kBlockSize : resident_block_size_arg;
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
+  const int max_request_rows = (max_union_rows + top_k - 1) / top_k;
 
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
@@ -492,11 +494,16 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
   int32_t* s_counters = s_evict_off + (num_buffer_chunks + 1);
   unsigned int* s_done =
       reinterpret_cast<unsigned int*>(s_counters + kResidencyCounters);
-  int16_t* s_lru_out = reinterpret_cast<int16_t*>(s_done + num_buffer_chunks);
+  int32_t* s_row_valid =
+      reinterpret_cast<int32_t*>(s_done + num_buffer_chunks);
+  int16_t* s_lru_out = reinterpret_cast<int16_t*>(s_row_valid + max_request_rows);
 
   for (int i = tid; i < num_buffer_chunks + 1; i += blockDim.x) {
     s_chunk_off[i] = 0;
     s_evict_off[i] = 0;
+  }
+  for (int i = tid; i < max_request_rows; i += blockDim.x) {
+    s_row_valid[i] = 0;
   }
   if (tid < kResidencyCounters) {
     s_counters[tid] = 0;
@@ -505,8 +512,6 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
 
   // Phase 1: translate every row's request-relative positions in one pass,
   // resolve resident rows directly, and count the host-backed positions.
-  // s_chunk_off holds per-row valid counts until phase 2.
-  int32_t* s_row_valid = s_chunk_off;
   const int num_positions = (end_row - first_row) * top_k;
   const auto resolve_position = [&](const int position,
                                     const int32_t token_index) {
@@ -1378,9 +1383,10 @@ void hisparse_resolve_residency(
                   "max_union_rows must be in [1, hot_size], got ",
                   max_union_rows);
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
+  const int max_request_rows = (max_union_rows + top_k - 1) / top_k;
   const size_t fixed_smem_bytes =
       sizeof(int32_t) * (3 * num_buffer_chunks + 2 + kResidencyCounters) +
-      sizeof(int16_t) * hot_size;
+      sizeof(int16_t) * hot_size + sizeof(int32_t) * max_request_rows;
   const size_t min_smem_bytes =
       fixed_smem_bytes + 2 * sizeof(int32_t) * (max_union_rows + 1);
 
