@@ -360,6 +360,7 @@ class HiSparseConnectorWorker:
             dtype=torch.int64,
             device=self.request_state_indices.device,
         )
+        self._active_request_ids: frozenset[str] | None = None
         self._init_dma()
         if self.is_host_writer:
             for layer_index, handle in enumerate(cache_handles):
@@ -393,6 +394,7 @@ class HiSparseConnectorWorker:
                 )
                 if hasattr(self, "_state_row_request_hash"):
                     self._state_row_request_hash.fill_(-1)
+                    self._active_request_ids = None
         if indices.numel() > self.request_state_indices.numel():
             raise ValueError(
                 "HiSparse request-state mapping exceeds max_num_seqs: "
@@ -425,6 +427,13 @@ class HiSparseConnectorWorker:
         num_reqs = min(len(request_ids), runtime_state.numel())
         if num_reqs == 0:
             return
+        # A request keeps its state row for its lifetime, so a step with the
+        # same active request set cannot introduce a reused row. Decode steps
+        # almost always hit this path.
+        active_request_ids = frozenset(request_ids[:num_reqs])
+        if active_request_ids == self._active_request_ids:
+            return
+        self._active_request_ids = active_request_ids
         hashes = torch.tensor(
             [
                 zlib.crc32(str(request_id).encode())
