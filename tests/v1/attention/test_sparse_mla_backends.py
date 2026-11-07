@@ -2596,8 +2596,8 @@ def test_hisparse_maps_speculative_rows_through_request_state():
 @requires_hisparse_ops
 @pytest.mark.parametrize(
     "num_rows,row_stride,top_k",
-    [(8, 128, 128), (4, 32, 128), (8, 2048, 2048)],
-    ids=["disjoint", "overlap", "long_mtp"],
+    [(8, 128, 128), (4, 32, 128), (8, 2048, 2048), (8, 1, 1)],
+    ids=["disjoint", "overlap", "long_mtp", "small_top_k"],
 )
 def test_hisparse_speculative_rows_resolve_host_misses_consistently(
     num_rows, row_stride, top_k
@@ -2612,7 +2612,7 @@ def test_hisparse_speculative_rows_resolve_host_misses_consistently(
     """
     device = torch.device(DEVICE_TYPE)
     block_size, row_width = 64, 64
-    num_blocks = 2 * num_rows * top_k // block_size
+    num_blocks = max(1, 2 * num_rows * top_k // block_size)
 
     kv_pool = torch.randn(
         (num_blocks + 1, block_size, row_width), dtype=torch.float32
