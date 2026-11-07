@@ -394,6 +394,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         block_table=block_table[chunk_start:chunk_end],
                         block_size=attn_metadata.block_size // self.compress_ratio,
                         offset=0,
+                        max_gather_len=chunk_M,
                     )
 
             # Gather SWA KV
