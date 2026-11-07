@@ -193,13 +193,22 @@ def test_indexer_reads_the_model_eligibility_hook():
 
 
 class _FakeShardQAttn:
-    def __init__(self, capable: bool) -> None:
+    def __init__(self, capable: bool, *, main_batch: bool = True, caches=()) -> None:
         self.shardq_capable = capable
+        self.shardq_main_batch = main_batch
+        self.caches = list(caches)
         self.use_shardq = False
         self.workspace_allocations = 0
 
     def set_shardq_enabled(self, enabled: bool) -> None:
         self.use_shardq = bool(enabled and self.shardq_capable)
+        # Keep the old per-layer publish here so the aggregation test proves
+        # the model overrides last-writer-wins state.
+        for cache in self.caches:
+            cache.use_shardq = self.use_shardq
+
+    def shardq_shared_caches(self) -> list[object]:
+        return self.caches
 
     def allocate_shardq_workspace(self) -> None:
         if self.use_shardq:
@@ -207,8 +216,10 @@ class _FakeShardQAttn:
 
 
 class _FakeShardQLayer:
-    def __init__(self, capable: bool) -> None:
-        self.attn = _FakeShardQAttn(capable)
+    def __init__(self, attn) -> None:
+        self.attn = (
+            attn if isinstance(attn, _FakeShardQAttn) else _FakeShardQAttn(attn)
+        )
 
 
 def test_finalize_shardq_allocates_once_when_enabled():
@@ -228,6 +239,55 @@ def test_finalize_shardq_allocates_nothing_when_disabled():
     dsv41_model._finalize_shardq(layers, False)
     assert not any(layer.attn.use_shardq for layer in layers)
     assert sum(layer.attn.workspace_allocations for layer in layers) == 0
+
+
+def test_shared_cache_domain_falls_back_together():
+    """One head-sharded consumer of a shared cache decides the whole domain:
+    the top-k buffer has one layout, so a mixed group is invalid."""
+    from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+
+    cache = SimpleNamespace(use_shardq=False)
+    early = _FakeShardQAttn(True, caches=[cache])
+    late_main = _FakeShardQAttn(False, caches=[cache])
+    dsv41_model._finalize_shardq(
+        [_FakeShardQLayer(early), _FakeShardQLayer(late_main)], True
+    )
+    assert not early.use_shardq and not late_main.use_shardq
+    assert cache.use_shardq is False
+    assert early.workspace_allocations == 0
+
+
+def test_replay_only_layer_does_not_disable_shared_cache():
+    """A replay-only layer writes the same cache but never consumes the main
+    batch's top-k layout, so it must not clear the main-batch decision."""
+    from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+
+    cache = SimpleNamespace(use_shardq=False)
+    early = _FakeShardQAttn(True, caches=[cache])
+    replay = _FakeShardQAttn(False, main_batch=False, caches=[cache])
+    dsv41_model._finalize_shardq(
+        [_FakeShardQLayer(early), _FakeShardQLayer(replay)], True
+    )
+    assert early.use_shardq and not replay.use_shardq
+    assert cache.use_shardq is True
+    assert early.workspace_allocations == 1
+
+
+def test_shared_cache_disagreement_propagates_across_domains():
+    """A layer disabling one cache also disables the caches it shares with
+    other layers: the domains are connected through the layers."""
+    from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+
+    first, second = SimpleNamespace(use_shardq=False), SimpleNamespace(use_shardq=False)
+    left = _FakeShardQAttn(True, caches=[first])
+    middle = _FakeShardQAttn(False, caches=[first, second])
+    right = _FakeShardQAttn(True, caches=[second])
+    dsv41_model._finalize_shardq(
+        [_FakeShardQLayer(left), _FakeShardQLayer(middle), _FakeShardQLayer(right)],
+        True,
+    )
+    assert not any(layer.use_shardq for layer in (left, middle, right))
+    assert not first.use_shardq and not second.use_shardq
 
 
 @dataclass(eq=False)

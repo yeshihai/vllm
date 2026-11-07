@@ -285,18 +285,53 @@ def _finalize_shardq(layers: Iterable[nn.Module], enabled: bool) -> None:
 
     Each layer keeps its static ``shardq_capable`` (which also excludes the
     candidate source/consumers); this applies the bounded-replay decision on
-    top.  Allocating here, after that decision, keeps a disabled model from
-    reserving the exchange buffers.
+    top.  A shared cache feeds one top-k layout to every main-batch consumer,
+    so a cache is enabled only when all of its main-batch consumers are;
+    disagreement disables the whole connected domain and falls back to the
+    head-sharded path.  Replay-only layers do not participate: their private
+    builders force the head-sharded path.
     """
-    workspace_allocator: Callable[[], None] | None = None
+    attentions = []
     for layer in layers:
         attn = getattr(layer, "attn", None)
         set_enabled = getattr(attn, "set_shardq_enabled", None)
         if set_enabled is None:
             continue
         set_enabled(enabled)
-        if getattr(attn, "use_shardq", False) and workspace_allocator is None:
-            workspace_allocator = attn.allocate_shardq_workspace
+        attentions.append(attn)
+
+    domains: dict[int, tuple[object, list[object]]] = {}
+    for attn in attentions:
+        if not getattr(attn, "shardq_main_batch", False):
+            continue
+        for cache in attn.shardq_shared_caches():
+            entry = domains.setdefault(id(cache), (cache, []))
+            entry[1].append(attn)
+
+    disabled = {
+        id(attn)
+        for attn in attentions
+        if getattr(attn, "shardq_main_batch", False) and not attn.use_shardq
+    }
+    changed = True
+    while changed:
+        changed = False
+        for _, users in domains.values():
+            if any(id(user) in disabled for user in users):
+                for user in users:
+                    if id(user) not in disabled:
+                        disabled.add(id(user))
+                        changed = True
+    for attn in attentions:
+        if id(attn) in disabled and attn.use_shardq:
+            attn.set_shardq_enabled(False)
+    for cache, users in domains.values():
+        cache.use_shardq = all(user.use_shardq for user in users)
+
+    workspace_allocator = next(
+        (attn.allocate_shardq_workspace for attn in attentions if attn.use_shardq),
+        None,
+    )
     if workspace_allocator is not None:
         workspace_allocator()
 

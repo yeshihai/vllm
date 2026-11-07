@@ -145,6 +145,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
         # The model finalizes the runtime decision once every layer exists.
         self.use_shardq = False
+        # Layers at and after the cut only run on the bounded-replay
+        # microbatch, so they never consume the main batch's ShardQ layout.
+        self.shardq_main_batch = self.layer_id < replay_cut
 
     def allocate_shardq_workspace(self) -> None:
         """Allocate this model's shared ShardQ workspace at most once.
@@ -166,13 +169,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._shardq_workspace_allocated = True
 
     def set_shardq_enabled(self, enabled: bool) -> None:
-        """Enable/disable the token-sharded prefill path for this layer.
+        """Apply this layer's own ShardQ decision.
 
-        The model disables it when SWA bounded replay is off.  The candidate
-        source/consumers always stay head-sharded: their block buffer is
-        row-addressable, which ShardQ's compact row layout does not preserve.
-        The model hands every layer the shared candidate buffer, so the layer
-        id, not the buffer, decides the role.
+        The model publishes the shared caches after aggregating every
+        main-batch consumer (``_finalize_shardq``); a shared cache cannot be
+        switched per layer without changing the top-k layout its consumers
+        read.
         """
         enabled = bool(enabled and self.shardq_capable)
         if (
@@ -181,20 +183,24 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         ):
             enabled = False
         self.use_shardq = enabled
-        self.swa_cache_layer.use_shardq = enabled
+
+    def shardq_shared_caches(self) -> list[object]:
+        """Caches whose layout this layer's decision must agree with."""
+        caches: list[object] = [self.swa_cache_layer]
         if self.compressed_cache_prefix is not None:
             cache = self._static_forward_context.get(self.compressed_cache_prefix)
             if cache is not None:
-                cache.use_shardq = enabled
+                caches.append(cache)
         indexer = getattr(self, "indexer", None)
         indexer_op = getattr(indexer, "indexer_op", None)
         if indexer_op is not None:
-            indexer_op.k_cache.use_shardq = enabled
+            caches.append(indexer_op.k_cache)
             context_cache = self._static_forward_context.get(
                 indexer_op.k_cache.prefix
             )
             if context_cache is not None:
-                context_cache.use_shardq = enabled
+                caches.append(context_cache)
+        return caches
 
     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return dsv41_o_proj(self, attn_out, positions)
