@@ -610,7 +610,8 @@ def dequantize_and_gather_k_cache_triton(
         return
 
     if k_cache.shape[-1] == V41_BYTES_PER_TOKEN:
-        _dequantize_and_gather_k_mxfp8_kernel[(num_reqs, NUM_WORKERS)](
+        num_workers = gather_num_workers(max_gather_len)
+        _dequantize_and_gather_k_mxfp8_kernel[(num_reqs, num_workers)](
             out,
             out.stride(0),
             out.stride(1),
