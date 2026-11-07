@@ -130,3 +130,5 @@ Accuracy:
 - `harness/accuracy_full.sh`: GSM8K-1319 ON/OFF at 4096.
 - `harness/summarize_stage_a.py`, `harness/summarize_stage_b.py`,
   `harness/delta_stage_b.py`: result aggregation.
+- `harness/start_pd.sh` / `harness/start_pd_off.sh`: TP4 P/D launch scripts;
+  see `PD_FEASIBILITY.md` for the current HiSparse + NIXL blockers.
