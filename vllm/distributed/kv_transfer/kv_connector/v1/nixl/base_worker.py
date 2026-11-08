@@ -149,11 +149,9 @@ class _RegionPairs:
     partner: list[int]
     # Whether every paired layer is in the same cache group on both sides.
     groups_match: bool = True
-    # Whether the peer reported a cache group for each paired layer and it
-    # matches ours. ``groups_match`` is also false when a shared region spans
-    # groups; this one stays true then, i.e. the per-group block lists still
-    # line up.
-    layer_groups_match: bool = True
+    # The peer's cache group for each pair. It can differ from ``group`` in
+    # index (not membership) when the two sides order their groups apart.
+    remote_group: list[int] | None = None
     # Hybrid SSM models: the peer's regions holding SSM state, in the order its
     # SSM descriptors are built, and its PLE region (set by _pair_ssm_regions).
     remote_ssm_regions: list[int] | None = None
@@ -549,10 +547,9 @@ class NixlBaseConnectorWorker:
             for layer_name in layer_names:
                 remote_regions_by_layer[layer_name].append(region)
 
-        triples: dict[tuple[int, int, int], None] = {}
+        triples: dict[tuple[int, int, int, int], None] = {}
         layers: set[str] = set()
         groups_match = True
-        layer_groups_match = True
         for layer_name, remote_regions in remote_regions_by_layer.items():
             local_regions = self._regions_by_layer.get(layer_name)
             if local_regions is None:
@@ -569,17 +566,20 @@ class NixlBaseConnectorWorker:
                     f"regions on engine {engine_id} and {len(local_regions)} here."
                 )
             group = group_by_layer[layer_name]
+            # The peer's block lists follow its own cache-group order.
+            remote_group = (
+                remote_layer_groups.get(layer_name, group)
+                if remote_layer_groups
+                else group
+            )
             layers.add(layer_name)
-            # Block ids are listed per group, so the group numbers must match;
-            # a region shared by several groups (-1) cannot show that.
-            if remote_layer_groups and remote_layer_groups.get(layer_name) != group:
+            if remote_group != group:
                 groups_match = False
-                layer_groups_match = False
             for remote, local in zip(remote_regions, local_regions):
-                remote_group = remote_groups[remote] if remote_groups else group
-                if remote_group not in (group, _SHARED_REGION_GROUP_ID):
+                region_group = remote_groups[remote] if remote_groups else group
+                if region_group not in (group, _SHARED_REGION_GROUP_ID):
                     groups_match = False
-                triples[(remote, local, group)] = None
+                triples[(remote, local, group, remote_group)] = None
         missing = self._regions_by_layer.keys() - layers
         if missing:
             raise RuntimeError(
@@ -587,10 +587,10 @@ class NixlBaseConnectorWorker:
                 f"{sorted(missing, key=_region_sort_key)}."
             )
 
-        paired_regions = sorted({remote for remote, _, _ in triples})
+        paired_regions = sorted({remote for remote, *_ in triples})
         position = {region: i for i, region in enumerate(paired_regions)}
         partner = [-1] * len(paired_regions)
-        for remote, local, _ in triples:
+        for remote, local, *_ in triples:
             first = partner[position[remote]]
             if first < 0:
                 partner[position[remote]] = local
@@ -602,13 +602,13 @@ class NixlBaseConnectorWorker:
                     "regions of different block lengths."
                 )
         pairs = _RegionPairs(
-            remote=[position[remote] for remote, _, _ in triples],
-            local=[local for _, local, _ in triples],
-            group=[group for _, _, group in triples],
+            remote=[position[remote] for remote, *_ in triples],
+            local=[local for _, local, *_ in triples],
+            group=[group for _, _, group, _ in triples],
             remote_regions=paired_regions,
             partner=partner,
             groups_match=groups_match,
-            layer_groups_match=layer_groups_match,
+            remote_group=[remote_group for *_, remote_group in triples],
         )
         if self._has_mamba:
             self._pair_ssm_regions(pairs, engine_id)
@@ -1748,6 +1748,17 @@ class NixlBaseConnectorWorker:
                     block_stride = physical_page_size
                 else:
                     block_stride = cache.stride(0) * cache.element_size()
+                if is_host_resident:
+                    # A page rounded up to a kernel/packing alignment has a
+                    # stride longer than its payload, so cache.nbytes stops
+                    # short of the last block. Register the span the stride
+                    # addresses instead.
+                    registration_len = num_blocks * block_stride
+                    registration_ranges[storage_key] = (
+                        registration_base,
+                        registration_base + registration_len,
+                        region_device_id,
+                    )
                 # A connector that registers the backing as one memory region
                 # may need its length rounded up to a page boundary. Such a tail
                 # is shorter than one block, so it cannot make the storage
