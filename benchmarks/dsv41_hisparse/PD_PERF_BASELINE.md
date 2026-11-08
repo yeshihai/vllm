@@ -78,19 +78,63 @@ P 的 prefill 时间决定 TTFT，尝试把 P 的 `--max-num-batched-tokens`
    主要来自 D 侧拉取和 host 写入，量级远小于 prefill 本身。
 2. **decode ITL 有稳定的 ~4% ON 固定开销**：短 decode 且 miss=0 的点
    （8k/32k/64k/128k prefill）ON 仍高 3.5–4.9%，说明即使没有 host 读，
-   HiSparse 的 hot-cache/簿记路径也有固定成本。
+   HiSparse 的 hot-cache/簿记路径也有固定成本。**注意：这里的 D 是 eager**
+   （`--enforce-eager`），eager 的 ITL 约 90% 是 host 启动开销；开 CUDA
+   graphs 后 ITL 从 ~87ms 降到 ~9ms，ON/OFF 差缩到 ~0.6ms（见“图模式”）。
 3. **长上下文 miss 再叠加 ~1–2%**：128k longdecode 的 miss rate
    18.5–22.5%，ITL 额外增加；H2D 流量每个点 0.14–0.55GB。
 4. **吞吐**：conc 32 时 ON −3.1% 输出 token 吞吐，与 ITL 比例一致。
 5. 256k prefill 点 miss 25.7% 但 H2D 仅 0.09GB：该点的 host 读主要发生在
    后续 8 个 decode token，样本少，miss 率的绝对值不宜过度解读。
 
+## 图模式 decode（2026-11-09）
+
+eager 的 ITL 不是 GPU 计算下限：torch profiler 下 OFF eager 每步 GPU
+kernel 时间总和仅 ~8.8ms，而 ITL 为 83ms；ON 的 ~4% 差也以 host 侧开销
+为主。对 D 去掉 `--enforce-eager`（`FULL_AND_PIECEWISE`，decode batch
+1–32；图捕获 0.62 GiB）后：
+
+| 点位 | OFF eager | ON eager | OFF 图 | ON 图 | ON 图 / OFF 图 |
+|---|---:|---:|---:|---:|---:|
+| 128k c1 ITL (ms) | 83.07 | 87.22 | 8.71 | 9.30 | +6.8% |
+| 128k c4 ITL (ms) | 82.83 | 87.84 | 8.71 | 9.31 | +6.9% |
+| 4k/128 c32 ITL (ms) | 83.97 | 88.20 | 10.18 | 10.80 | +6.1% |
+| 4k/128 c32 吞吐 (tok/s) | 230.4 | 223.3 | 331.9 | 327.3 | −1.4% |
+| 128k c1 TTFT (ms) | 13621.6 | 13813.5 | 13892.9 | 13776.7 | P 侧 prefill，不变 |
+
+- 正确性：ON 图模式 GSM8K-200 **0.890**（eager ON 0.895/0.905），全量
+  GSM8K-1319 **0.9121 / 152.2s**（eager ON 0.9098/763.7s，eager OFF
+  0.9113/713.1s）。精度在噪声内，端到端约 5×。
+- 128k c4 ON 图模式期间 hot-buffer miss +4.47e6、host→device +2.61GB，
+  ITL 仍为 9.31ms：host miss 路径在图模式下工作正常，且不再主导 ITL。
+- 容量：GPU+host 8,621,930 tokens（8.22x；eager 9,266,616 / 8.84x），
+  HiSparse steady-state 8.36x；图捕获占 0.62 GiB，容量代价约 7%。
+- 复现：`EAGER=0 bash harness/start_pd_asym.sh prefill|decode`（默认图
+  模式，P 保持 NIXL-only eager，D 为 NIXL+HiSparse 图模式）；
+  `EAGER=1` 回到本文件上面的 eager 数字。
+
+### profiler 归因（eager）
+
+- HiSparse 自己的 `hisparse_resolve_residency` / `gather_compact` 合计仅
+  ~0.1–0.15ms/step，不是 ~4% 的来源。
+- 打开 HiSparse 会把 FlashInfer all-reduce 从 `mnnvl` 强制退回 `trtllm`
+  （vllm#65201，规避 vllm#64327），用 `VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl`
+  覆盖可回收 ~0.6–0.9ms/step；FlashInfer 修复
+  flashinfer-ai/flashinfer#7782 已于 11-02 合入，但本机 0.7.2.post1 未包含，
+  暂不能用该 env 长期开启（#64327 的竞态在 host spill 下仍可能触发）。
+- 剩余为 host 侧：每步约 800 个额外 aten op、~80 个额外 kernel launch，
+  来自每个 KV cache group 的 metadata build（`sparse_swa.build`、block
+  table 切片）与 HiSparse runtime 的 view/slice；eager 下落在关键路径，
+  图模式后基本消失。
+
 ## 下一步
 
-- 对固定 ~4% ITL 开销做 decode 侧 profile（hot-cache 查找/槽位间接寻址），
-  这是当前 ON 的主要成本；miss 部分只占 1–2%。
-- 在 miss rate/H2D 匹配的前提下再比较代码改动，避免把 cache 波动归因到
-  实现上。
+- 以图模式为 D 的默认 baseline 重新积累数据（长上下文 c1/c4、c32 吞吐、
+  容量、GSM8K）；eager 数字仅用于对照 host 开销。
+- HiSparse 在图模式下的剩余 ~0.6ms/step（约 6–7%）优先看 host miss 与
+  每步簿记；miss rate/H2D 必须匹配后再比较代码改动。
+- 等 FlashInfer 发布包含 #7782 的版本后，移除 vllm#65201 的 HiSparse
+  回退限制，可再回收 ~0.6–0.9ms/step。
 - P 侧 MBT 已试：32768 起不来（KV 被激活挤到 0.08 GiB），16384 无实质
   收益，维持 8192。要压 longdecode TTFT 需要算法/并行度层面的改动，
   而不是简单调大 MBT。
@@ -98,6 +142,12 @@ P 的 prefill 时间决定 TTFT，尝试把 P 的 `--max-num-batched-tokens`
 ## 复现
 
 ```bash
+# 图模式 ON（P NIXL-only，D NIXL+HiSparse；默认 CUDA graphs）
+EAGER=0 bash benchmarks/dsv41_hisparse/harness/start_pd_asym.sh prefill  # :8100
+EAGER=0 bash benchmarks/dsv41_hisparse/harness/start_pd_asym.sh decode   # :8200
+# eager 对照
+EAGER=1 bash benchmarks/dsv41_hisparse/harness/start_pd_asym.sh decode
+
 # ON
 SEED_BASE=10000 bash benchmarks/dsv41_hisparse/harness/bench_pd_dsv41.sh pd_on_cold all
 # OFF（先重启 D 为 NixlConnector-only）
