@@ -29,6 +29,26 @@ cache-hit 而不是冷 prefill。本次早期矩阵因此失真（例如 OFF 8k 
 - 所有测量点 `--num-warmups 0`；
 - ON/OFF 使用不同的 `SEED_BASE`（10000/20000），保证两次运行的随机
   prompt 不同，P 的 prefix cache 不会跨配置命中。
+- 每次测量都必须用**全新的 SEED_BASE**：失败/半途而废的 run 仍然会把
+  prefill 请求发给 P，P 的 prefix cache 会被预热；用同一个 SEED_BASE
+  重跑会全部变成 cache hit。本次 MBT 实验就踩到了这个坑。
+
+## MBT 实验（P 侧）
+
+P 的 prefill 时间决定 TTFT，尝试把 P 的 `--max-num-batched-tokens`
+从 8192 提高：
+
+| P MBT | 结果 |
+|---:|---|
+| 32768 | 启动失败：KV cache 只剩 0.08 GiB，估算最大模型长度 3232（激活显存挤占 KV） |
+| 16384 | 可启动。冷 64k TTFT 6.52–6.54 s（新 seed）vs 8192 的 6.77 s，差 ~3.7%，在波动内 |
+| 8192 | 保持 |
+
+注意：MBT16k 首次测量出现 3–7x 的“加速”，是因为之前一次失败的 run
+已经把同一批 prompt 的 KV 留在了 P 的 prefix cache 中；更换新 seed 后
+加速消失。结论：在当前 0.92 显存预算下，提高 P 的 MBT 不是有效的 TTFT
+杠杆；P 的冷 prefill 速率约 9–10k tok/s，要压 TTFT 需要算法/并行度层面
+的改动（chunk 调度、gather workers 或更多 prefill GPU）。
 
 ## 结果（冷启动，随机 prompt，temperature 0）
 
@@ -71,8 +91,9 @@ cache-hit 而不是冷 prefill。本次早期矩阵因此失真（例如 OFF 8k 
   这是当前 ON 的主要成本；miss 部分只占 1–2%。
 - 在 miss rate/H2D 匹配的前提下再比较代码改动，避免把 cache 波动归因到
   实现上。
-- P 侧 MBT 与 chunk 策略决定 TTFT；若要压 longdecode TTFT，优先调 P 的
-  prefill 并发/MBT，而不是 NIXL 传输。
+- P 侧 MBT 已试：32768 起不来（KV 被激活挤到 0.08 GiB），16384 无实质
+  收益，维持 8192。要压 longdecode TTFT 需要算法/并行度层面的改动，
+  而不是简单调大 MBT。
 
 ## 复现
 
