@@ -132,3 +132,7 @@ Accuracy:
   `harness/delta_stage_b.py`: result aggregation.
 - `harness/start_pd.sh` / `harness/start_pd_off.sh`: TP4 P/D launch scripts;
   see `PD_FEASIBILITY.md` for the current HiSparse + NIXL blockers.
+- `harness/bench_pd_dsv41.sh`: cold-prompt P/D serving matrix (TTFT, ITL,
+  throughput) with HiSparse counter snapshots; `analyze_pd.py` /
+  `compare_pd.py` aggregate the results. See `PD_PERF_BASELINE.md` for the
+  ON/OFF cold baseline and the `--num-warmups` caveat.
