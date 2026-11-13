@@ -73,6 +73,9 @@ pool and uses the same block and layer offsets. MLA source KV is replicated
 across TP ranks, so this stores one physical copy instead of one copy per rank.
 TP rank 0 writes the shared host pool; peers wait on its IPC events before
 reading it. Other executor and parallel layouts retain private per-rank pools.
+Sequence-parallel MoE is not supported: it shards the token stream across TP
+ranks, while the replicated host cache requires every rank to see the full
+token batch.
 
 The shared layout backs the per-replica logical capacity with one physical pool;
 the private layout allocates one physical pool per rank. Physical pool size

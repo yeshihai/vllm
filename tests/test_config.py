@@ -685,6 +685,24 @@ def test_hisparse_rejects_pipeline_parallelism(monkeypatch):
         )
 
 
+def test_hisparse_rejects_sequence_parallel_moe(monkeypatch):
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
+    with pytest.raises(ValueError, match="sequence-parallel MoE"):
+        VllmConfig(
+            attention_config=AttentionConfig(hisparse_config=HiSparseConfig()),
+            parallel_config=ParallelConfig(
+                enable_expert_parallel=True,
+                tensor_parallel_size=2,
+                data_parallel_size=2,
+            ),
+        )
+
+
 def test_hisparse_rejects_full_cudagraph_mode(monkeypatch):
     monkeypatch.setattr(
         current_platform,
