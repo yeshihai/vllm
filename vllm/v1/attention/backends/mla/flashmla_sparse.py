@@ -1262,10 +1262,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             if q.shape[1] == self.num_heads:
                 attn_out = compact_out[:num_mqa_tokens]
             else:
-                # ShardQ's local-token call runs with every rank's heads, so
-                # its output is as wide as padded_out, not compact_out.
+                # ShardQ's local-token call runs with every rank's heads. The
+                # padded workspace may be wider than the actual head count, so
+                # expose only the real heads to the copy and unshard paths.
                 assert q.shape[1] <= padded_out.shape[1]
-                attn_out = padded_out[:num_mqa_tokens]
+                attn_out = padded_out[:num_mqa_tokens, : q.shape[1]]
 
             if num_decode_tokens > 0:
                 attn_out[:num_decode_tokens] = _fp8_decode(
