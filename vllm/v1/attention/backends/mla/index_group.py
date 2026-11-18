@@ -293,9 +293,7 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
     def _prefill_num_decodes(attn_metadata: Any) -> int:
         # A ShardQ-narrowed batch reports no decodes but still stages against
         # the full batch's prefill rows.
-        return getattr(attn_metadata, "shardq_num_decodes", 0) or (
-            attn_metadata.num_decodes
-        )
+        return attn_metadata.shardq_num_decodes or attn_metadata.num_decodes
 
     def _prefill_gather_plan(
         self, layer_index: int, attn_metadata: Any
