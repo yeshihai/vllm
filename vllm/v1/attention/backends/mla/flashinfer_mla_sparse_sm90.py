@@ -33,6 +33,8 @@ kernel but not wired yet (it needs a group-quantizing cache-write op).
 """
 
 import functools
+import os
+import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -64,6 +66,229 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+_LAB_DUMP_STATE = {"count": 0}
+
+
+def _lab_maybe_dump_logical(logical_indices, layer, rows):
+    """Dump indexer-selected logical token positions (env gated)."""
+    dump_dir = os.environ.get("FP8LAB_DUMP_DIR")
+    if not dump_dir or os.environ.get("FP8LAB_DUMP_LOGICAL", "0") != "1":
+        return
+    if os.environ.get("FP8LAB_DUMP_REQUIRE_MARKER", "0") == "1" and not os.path.exists(
+        os.path.join(dump_dir, "ENABLE")
+    ):
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    if rows < 1024:
+        return
+    layer_name = str(getattr(layer, "layer_name", "unknown"))
+    _m = re.search(r"layers\.(\d+)", layer_name)
+    if os.environ.get("FP8LAB_DUMP_LAYERS") and _m:
+        wanted = {
+            int(x) for x in os.environ["FP8LAB_DUMP_LAYERS"].split(",") if x.strip()
+        }
+        if int(_m.group(1)) not in wanted:
+            return
+    _lc = _LAB_DUMP_STATE.setdefault("layer_counts", {})
+    _lc[layer_name] = _lc.get(layer_name, 0) + 1
+    tag = _lc[layer_name]
+    with torch.no_grad():
+        os.makedirs(dump_dir, exist_ok=True)
+        if os.environ.get("FP8LAB_DUMP_LAST", "0") == "1":
+            ridx = torch.arange(
+                max(0, rows - 64), rows, device=logical_indices.device
+            ).long()
+        else:
+            step = max(1, rows // 64)
+            ridx = torch.arange(0, rows, step, device=logical_indices.device)[:64].long()
+        payload = {
+            "indices": logical_indices[ridx].detach().to("cpu"),
+            "rows": int(rows),
+            "layer": layer_name,
+            "tag": str(tag),
+        }
+        path = os.path.join(
+            dump_dir, "logidx_%s_%s.pt" % (tag, layer_name.replace("/", "_"))
+        )
+        torch.save(payload, path)
+    print(
+        "[FP8LAB] logical idx dumped %s rows=%d sample=%d path=%s"
+        % (layer_name, rows, len(ridx), path),
+        flush=True,
+    )
+
+
+def _lab_maybe_dump(q_nope, kv_cache, topk_slots, state, block_size, layer, kv_lora_rank,
+                    sm_scale=0.0):
+    """Dump real MLA kernel inputs for the offline accuracy lab (env gated)."""
+    dump_dir = os.environ.get("FP8LAB_DUMP_DIR")
+    if not dump_dir:
+        return
+    if os.environ.get("FP8LAB_DUMP_LOGICAL", "0") == "1":
+        return
+    if os.environ.get("FP8LAB_DUMP_REQUIRE_MARKER", "0") == "1" and not os.path.exists(
+        os.path.join(dump_dir, "ENABLE")
+    ):
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    rows = q_nope.shape[0]
+    layer_name = str(getattr(layer, "layer_name", "unknown"))
+    _m = re.search(r"layers\.(\d+)", layer_name)
+    if os.environ.get("FP8LAB_DUMP_LAYERS") and _m:
+        wanted = {
+            int(x) for x in os.environ["FP8LAB_DUMP_LAYERS"].split(",") if x.strip()
+        }
+        if int(_m.group(1)) not in wanted:
+            return
+    if rows < 1024:
+        if os.environ.get("FP8LAB_DUMP_DECODE", "0") != "1":
+            return
+        if rows > int(os.environ.get("FP8LAB_DUMP_DECODE_MAX_ROWS", "2")):
+            return
+        n = _LAB_DUMP_STATE.get("decode_count", 0)
+        if n >= int(os.environ.get("FP8LAB_DUMP_DECODE_STEPS", "4")):
+            return
+        _LAB_DUMP_STATE["decode_count"] = n + 1
+        _LAB_DUMP_STATE["tag"] = "decode_%d" % n
+    else:
+        _LAB_DUMP_STATE["count"] += 1
+        targets = os.environ.get(
+            "FP8LAB_DUMP_INDICES", os.environ.get("FP8LAB_DUMP_INDEX", "1")
+        )
+        target_set = {int(x) for x in targets.split(",") if x.strip()}
+        if _LAB_DUMP_STATE["count"] not in target_set:
+            return
+        _LAB_DUMP_STATE["tag"] = str(_LAB_DUMP_STATE["count"])
+    with torch.no_grad():
+        os.makedirs(dump_dir, exist_ok=True)
+        if os.environ.get("FP8LAB_DUMP_LAST", "0") == "1":
+            ridx = torch.arange(max(0, rows - 64), rows, device=q_nope.device).long()
+        else:
+            step = max(1, rows // 64)
+            ridx = torch.arange(0, rows, step, device=q_nope.device)[:64].long()
+        kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
+        flat = kv_rows.reshape(-1, 1, kv_rows.shape[-1])
+        ckv = flat[..., :kv_lora_rank]
+        indptr = state.kv_indptr[: rows + 1].to(torch.int64)
+        widths = (indptr[ridx + 1] - indptr[ridx]).to(torch.int64)
+        maxw = int(widths.max().item())
+        if os.environ.get("FP8LAB_DUMP_IDX_ONLY", "0") == "1":
+            idxbuf = torch.full(
+                (len(ridx), maxw), -1, dtype=torch.int64, device=ckv.device
+            )
+            indptr_i = indptr.cpu().tolist()
+            widths_i = widths.cpu().tolist()
+            for j, r in enumerate(ridx.cpu().tolist()):
+                start, w = indptr_i[r], widths_i[j]
+                if w <= 0:
+                    continue
+                idxbuf[j, :w] = state.kv_indices[start : start + w].to(torch.int64)
+            tag = str(_LAB_DUMP_STATE.get("tag", "0"))
+            path = os.path.join(
+                dump_dir, "idx_%s_%s.pt" % (tag, layer_name.replace("/", "_"))
+            )
+            torch.save(
+                {
+                    "indices": idxbuf.detach().to("cpu"),
+                    "widths": widths.detach().to("cpu"),
+                    "rows": int(rows),
+                    "layer": layer_name,
+                    "block_size": int(block_size),
+                    "tag": tag,
+                },
+                path,
+            )
+            print(
+                "[FP8LAB] idx dumped %s rows=%d sample=%d maxw=%d path=%s"
+                % (layer_name, rows, len(ridx), maxw, path),
+                flush=True,
+            )
+            return
+        buf = torch.zeros(
+            (len(ridx), maxw, 1, kv_lora_rank), dtype=ckv.dtype, device=ckv.device
+        )
+        mask = torch.zeros((len(ridx), maxw), dtype=torch.bool, device=ckv.device)
+        idxbuf = torch.full((len(ridx), maxw), -1, dtype=torch.int64, device=ckv.device)
+        indptr_cpu = indptr.cpu().tolist()
+        widths_cpu = widths.cpu().tolist()
+        for j, r in enumerate(ridx.cpu().tolist()):
+            start, w = indptr_cpu[r], widths_cpu[j]
+            if w <= 0:
+                continue
+            idx = state.kv_indices[start : start + w].to(torch.int64)
+            buf[j, :w] = ckv[idx]
+            mask[j, :w] = True
+            idxbuf[j, :w] = idx
+        payload = {
+            "q_nope": q_nope[ridx].detach().to("cpu"),
+            "latent": buf.detach().to("cpu"),
+            "mask": mask.detach().to("cpu"),
+            "widths": widths.detach().to("cpu"),
+            "indices": idxbuf.detach().to("cpu"),
+            "rows": int(rows),
+            "layer": layer_name,
+            "k_scale": float(getattr(layer, "_k_scale_float", 0.0) or 0.0),
+            "kv_lora_rank": int(kv_lora_rank),
+            "block_size": int(block_size),
+            "num_heads": int(q_nope.shape[1]),
+            "sm_scale": float(sm_scale),
+        }
+        path = os.path.join(
+            dump_dir,
+            "dump_%s_%s.pt"
+            % (_LAB_DUMP_STATE.get("tag", "0"), layer_name.replace("/", "_")),
+        )
+        torch.save(payload, path)
+    print(
+        "[FP8LAB] dumped %s rows=%d sample=%d maxw=%d path=%s"
+        % (layer_name, rows, len(ridx), maxw, path),
+        flush=True,
+    )
+
+
+
+
+def _lab_maybe_dump_out(out, layer):
+    """Dump kernel outputs for decode steps (env gated, lab only)."""
+    d = os.environ.get("FP8LAB_DUMP_DIR")
+    if not d or os.environ.get("FP8LAB_DUMP_OUT", "0") != "1":
+        return
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    rows = out.shape[0]
+    if rows > int(os.environ.get("FP8LAB_DUMP_DECODE_MAX_ROWS", "2")):
+        return
+    if not os.path.exists(os.path.join(d, "ENABLE")):
+        return
+    layer_name = str(getattr(layer, "layer_name", "unknown"))
+    m = re.search(r"layers\.(\d+)", layer_name)
+    if os.environ.get("FP8LAB_DUMP_LAYERS") and m:
+        wanted = {
+            int(x) for x in os.environ["FP8LAB_DUMP_LAYERS"].split(",") if x.strip()
+        }
+        if int(m.group(1)) not in wanted:
+            return
+    n = _LAB_DUMP_STATE.get("out_count", 0)
+    _LAB_DUMP_STATE["out_count"] = n + 1
+    torch.save(
+        {"out": out.detach().to("cpu"), "layer": layer_name},
+        os.path.join(d, "out_%d_%s.pt" % (n, layer_name.replace("/", "_"))),
+    )
 
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
 _WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -668,6 +893,7 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
+        _lab_maybe_dump_logical(topk_indices, layer, num_tokens)
         index_group = self.index_group
         if isinstance(index_group, HiSparseMLAIndexGroup):
             num_decode_tokens = attn_metadata.num_decode_tokens
@@ -772,6 +998,8 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
         assert state is not None
         # Pack valid prefixes at the offsets refreshed by plan() before replay.
         state.pack_indices(topk_slots)
+        _lab_maybe_dump(q_nope, kv_cache, topk_slots, state, block_size, layer,
+                        self.kv_lora_rank, getattr(self, "scale", 0.0))
 
         kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
         flat = (
@@ -785,4 +1013,17 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
             if self.use_fp8_kv_cache
             else {}
         )
-        return state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
+        if self.use_fp8_kv_cache and os.environ.get("FP8LAB_DEQUANT", "0") == "1":
+            # Lab-only: force the BF16 dequant attention path on the same fp8
+            # cache by passing the per-token scale array the kernel already
+            # supports. Isolates the kernel from the cache format.
+            _s = float(layer._k_scale_float or 1.0)
+            scale_kwargs = {
+                "ckv_scale_arr": torch.full(
+                    (kv_rows.shape[0], 1, 4), _s, dtype=torch.float32, device=kv_rows.device
+                ),
+                "kpe_scale": 1.0,
+            }
+        out = state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
+        _lab_maybe_dump_out(out, layer)
+        return out
